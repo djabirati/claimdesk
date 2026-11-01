@@ -50,6 +50,28 @@ class RunStatus(StrEnum):
 
 class JobKind(StrEnum):
     TRIAGE = "triage"
+    AGENT = "agent"  # queued after a successful triage of a claim
+
+
+class AgentRunStatus(StrEnum):
+    COMPLETED = "completed"  # the agent finished and wrote its note for the reviewer
+    STEP_LIMIT = "step_limit"  # stopped after the maximum number of model calls
+    ERROR = "error"  # the provider did not answer, a retry may work
+    REJECTED = "rejected"  # the provider refused the request, a retry would not
+
+
+class ActionKind(StrEnum):
+    REFUND = "refund"
+    REPLACEMENT = "replacement"
+    CARRIER_CLAIM = "carrier_claim"
+    REPLY = "reply"
+
+
+class ActionStatus(StrEnum):
+    PROPOSED = "proposed"  # written by the agent, waiting for a person
+    APPROVED = "approved"  # approved by a person, being executed
+    EXECUTED = "executed"
+    REJECTED = "rejected"  # refused by a person
 
 
 class JobStatus(StrEnum):

@@ -40,7 +40,7 @@ def test_worker_triages_the_email_and_logs_the_run(
     fake_llm.script = [triage_json()]
     email_id = client.post("/emails", json=PAYLOAD).json()["id"]
 
-    assert drain() == 1
+    assert drain() == 2  # the triage, then the agent job queued because it is a claim
 
     body = client.get(f"/emails/{email_id}").json()
     assert body["status"] == "triaged"
@@ -52,10 +52,14 @@ def test_worker_triages_the_email_and_logs_the_run(
     assert run["prompt_version"] == "triage-v1"
     assert run["input_tokens"] > 0
     assert Decimal(run["cost_usd"]) > 0
-    job = body["jobs"][0]
-    assert job["status"] == "done"
-    assert job["attempts"] == 1
-    assert job["finished_at"] is not None
+    triage_job, agent_job = body["jobs"]
+    assert triage_job["kind"] == "triage"
+    assert triage_job["status"] == "done"
+    assert triage_job["attempts"] == 1
+    assert triage_job["finished_at"] is not None
+    assert agent_job["kind"] == "agent"
+    assert agent_job["status"] == "done"
+    assert body["agent_runs"][0]["status"] == "completed"
 
 
 def test_email_with_flags_goes_to_review(

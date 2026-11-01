@@ -32,6 +32,8 @@ class Settings(BaseSettings):
 
     # Number of LLM calls allowed for one email when the output fails validation.
     triage_max_attempts: int = 2
+    # Most model calls in one agent run, so a confused agent cannot loop (and spend) forever.
+    agent_max_steps: int = 8
 
     # Queue and worker.
     # How many times a job may run before it is marked failed (provider errors are retried).
@@ -39,7 +41,8 @@ class Settings(BaseSettings):
     # Delay before the first retry, multiplied by 4 at each new failure (15 s, 1 min, 4 min).
     job_retry_base_seconds: float = 15
     # A job still "running" after this long is considered abandoned (worker crashed or killed).
-    job_lock_timeout_seconds: float = 300
+    # It must outlast the longest job: an agent run of agent_max_steps calls (see below).
+    job_lock_timeout_seconds: float = 900
     # How long an idle worker waits before looking at the queue again.
     worker_poll_seconds: float = 1.0
 
@@ -50,13 +53,15 @@ class Settings(BaseSettings):
         return None if value == "" else value
 
     @model_validator(mode="after")
-    def triage_ends_before_the_lock_expires(self) -> Self:
-        # One triage makes up to triage_max_attempts calls. If they can last longer than
-        # the lock timeout, a job still waiting for the model is handed to a second worker.
-        longest_triage = self.llm_timeout_seconds * self.triage_max_attempts
-        if longest_triage >= self.job_lock_timeout_seconds:
+    def jobs_end_before_the_lock_expires(self) -> Self:
+        # A triage makes up to triage_max_attempts model calls, an agent run up to
+        # agent_max_steps. If a job can last longer than the lock timeout, a job still
+        # waiting for the model is handed to a second worker.
+        calls = max(self.triage_max_attempts, self.agent_max_steps)
+        longest_job = self.llm_timeout_seconds * calls
+        if longest_job >= self.job_lock_timeout_seconds:
             raise ValueError(
-                f"llm_timeout_seconds x triage_max_attempts ({longest_triage:g} s) must be "
+                f"llm_timeout_seconds x {calls} model calls ({longest_job:g} s) must be "
                 f"below job_lock_timeout_seconds ({self.job_lock_timeout_seconds:g} s)"
             )
         return self

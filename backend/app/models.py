@@ -7,14 +7,14 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
-from app.enums import EmailStatus, JobStatus
+from app.enums import ActionStatus, EmailStatus, JobStatus
 
 # JSONB on Postgres (indexable, compact), plain JSON elsewhere (SQLite in unit tests).
 JSONType = JSON().with_variant(JSONB(), "postgresql")
 
 
 class Order(Base):
-    """A customer order from the (fictional) retailer. Tools will read these in step 2."""
+    """A customer order from the (fictional) retailer. The agent's tools read these."""
 
     __tablename__ = "orders"
 
@@ -51,6 +51,12 @@ class Email(Base):
     jobs: Mapped[list["Job"]] = relationship(
         back_populates="email", order_by="Job.id", cascade="all, delete-orphan"
     )
+    agent_runs: Mapped[list["AgentRun"]] = relationship(
+        back_populates="email", order_by="AgentRun.id", cascade="all, delete-orphan"
+    )
+    actions: Mapped[list["ProposedAction"]] = relationship(
+        back_populates="email", order_by="ProposedAction.id", cascade="all, delete-orphan"
+    )
 
 
 class TriageRun(Base):
@@ -79,7 +85,7 @@ class TriageRun(Base):
 class Job(Base):
     """One piece of background work on one email, waiting in the queue or done.
 
-    The queue is this table: no separate broker to run. See app/queue/jobs.py.
+    The queue is this table: no separate broker to run. See app/jobs.py.
     """
 
     __tablename__ = "jobs"
@@ -101,3 +107,59 @@ class Job(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     email: Mapped[Email] = relationship(back_populates="jobs")
+
+
+class AgentRun(Base):
+    """One run of the agent on one email: every model call, every tool call, the cost."""
+
+    __tablename__ = "agent_runs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    email_id: Mapped[int] = mapped_column(ForeignKey("emails.id", ondelete="CASCADE"), index=True)
+    model: Mapped[str] = mapped_column(String(80))
+    prompt_version: Mapped[str] = mapped_column(String(40))
+    status: Mapped[str] = mapped_column(String(20))
+    steps: Mapped[int]  # number of model calls
+    input_tokens: Mapped[int]
+    output_tokens: Mapped[int]
+    latency_ms: Mapped[int]
+    cost_usd: Mapped[Decimal] = mapped_column(Numeric(10, 6))
+    # The agent's last message, for the person who reviews its proposals.
+    note: Mapped[str | None] = mapped_column(Text)
+    flags: Mapped[list[str]] = mapped_column(JSONType, default=list)
+    # One entry per tool call: step, tool, arguments, result, duration.
+    trace: Mapped[list[dict[str, Any]]] = mapped_column(JSONType, default=list)
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    email: Mapped[Email] = relationship(back_populates="agent_runs")
+    actions: Mapped[list["ProposedAction"]] = relationship(
+        back_populates="agent_run", order_by="ProposedAction.id"
+    )
+
+
+class ProposedAction(Base):
+    """An action the agent proposed. Nothing happens until a person approves it."""
+
+    __tablename__ = "actions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    email_id: Mapped[int] = mapped_column(ForeignKey("emails.id", ondelete="CASCADE"), index=True)
+    agent_run_id: Mapped[int] = mapped_column(
+        ForeignKey("agent_runs.id", ondelete="CASCADE"), index=True
+    )
+    kind: Mapped[str] = mapped_column(String(30))
+    status: Mapped[str] = mapped_column(String(20), default=ActionStatus.PROPOSED, index=True)
+    order_id: Mapped[str | None] = mapped_column(String(16))
+    # What would be done: amount for a refund, message for a reply...
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict)
+    rationale: Mapped[str | None] = mapped_column(Text)  # the agent's reason
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    decided_by: Mapped[str | None] = mapped_column(String(120))
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    decision_note: Mapped[str | None] = mapped_column(Text)
+    executed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSONType)
+
+    email: Mapped[Email] = relationship(back_populates="actions")
+    agent_run: Mapped[AgentRun] = relationship(back_populates="actions")

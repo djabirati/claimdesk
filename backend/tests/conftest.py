@@ -1,5 +1,8 @@
 import json
 from collections.abc import Callable, Iterator
+from datetime import datetime
+from decimal import Decimal
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -12,7 +15,31 @@ from app.config import Settings
 from app.db import Base, get_session
 from app.llm.fake import FakeLLMClient
 from app.main import app
+from app.models import Order
 from app.worker import run_once
+
+SEED_ORDERS = Path(__file__).resolve().parents[2] / "data" / "seed" / "orders.json"
+
+
+def add_seed_orders(session: Session) -> None:
+    """The 15 fictional orders of data/seed, as the agent's tools will find them."""
+    for row in json.loads(SEED_ORDERS.read_text(encoding="utf-8")):
+        session.add(
+            Order(
+                id=row["id"],
+                customer_name=row["customer_name"],
+                customer_email=row["customer_email"],
+                total_amount=Decimal(row["total_amount"]),
+                carrier=row["carrier"],
+                tracking_number=row["tracking_number"],
+                status=row["status"],
+                shipped_at=datetime.fromisoformat(row["shipped_at"]),
+                delivered_at=(
+                    datetime.fromisoformat(row["delivered_at"]) if row["delivered_at"] else None
+                ),
+            )
+        )
+    session.commit()
 
 
 def triage_json(**overrides: object) -> str:
