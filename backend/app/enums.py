@@ -45,3 +45,14 @@ class RunStatus(StrEnum):
     SUCCESS = "success"
     INVALID_OUTPUT = "invalid_output"
     ERROR = "error"
+
+
+class JobKind(StrEnum):
+    TRIAGE = "triage"
+
+
+class JobStatus(StrEnum):
+    QUEUED = "queued"  # waiting for a worker (until run_after when it is a retry)
+    RUNNING = "running"  # claimed by a worker
+    DONE = "done"
+    FAILED = "failed"  # no attempt left, or an error that a retry would not fix

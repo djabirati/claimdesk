@@ -84,6 +84,20 @@ class TriageRunOut(BaseModel):
     created_at: datetime | None
 
 
+class JobOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    kind: str
+    status: str
+    attempts: int
+    max_attempts: int
+    run_after: datetime
+    last_error: str | None
+    created_at: datetime | None
+    finished_at: datetime | None
+
+
 class EmailOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -99,3 +113,4 @@ class EmailOut(BaseModel):
 
 class EmailDetail(EmailOut):
     runs: list[TriageRunOut]
+    jobs: list[JobOut]

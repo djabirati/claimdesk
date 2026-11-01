@@ -1,5 +1,5 @@
 import json
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 import pytest
 from fastapi.testclient import TestClient
@@ -8,10 +8,11 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app import models  # noqa: F401  (registers tables)
-from app.api.deps import get_llm
+from app.config import Settings
 from app.db import Base, get_session
 from app.llm.fake import FakeLLMClient
 from app.main import app
+from app.worker import run_once
 
 
 def triage_json(**overrides: object) -> str:
@@ -30,9 +31,15 @@ def triage_json(**overrides: object) -> str:
 
 
 @pytest.fixture
+def settings() -> Settings:
+    # Ignore any local .env file so tests behave the same everywhere.
+    return Settings(_env_file=None, gemini_api_key=None)  # type: ignore[call-arg]
+
+
+@pytest.fixture
 def session_factory() -> Iterator[sessionmaker[Session]]:
     # In-memory SQLite shared across threads: fast, isolated, no server needed.
-    # Migrations themselves are tested against real Postgres in CI.
+    # Migrations and the queue's locking are tested against real Postgres in CI.
     engine = create_engine(
         "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
     )
@@ -47,13 +54,28 @@ def fake_llm() -> FakeLLMClient:
 
 
 @pytest.fixture
-def client(session_factory: sessionmaker[Session], fake_llm: FakeLLMClient) -> Iterator[TestClient]:
+def client(session_factory: sessionmaker[Session]) -> Iterator[TestClient]:
     def override_session() -> Iterator[Session]:
         with session_factory() as session:
             yield session
 
     app.dependency_overrides[get_session] = override_session
-    app.dependency_overrides[get_llm] = lambda: fake_llm
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def drain(
+    session_factory: sessionmaker[Session], fake_llm: FakeLLMClient, settings: Settings
+) -> Callable[[], int]:
+    """Run the worker until no job is due, as the background worker would. Returns how
+    many jobs were taken. Retries scheduled in the future are left in the queue."""
+
+    def _drain() -> int:
+        taken = 0
+        while run_once(session_factory, fake_llm, settings, worker_id="test-worker"):
+            taken += 1
+        return taken
+
+    return _drain

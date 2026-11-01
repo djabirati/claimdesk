@@ -78,3 +78,38 @@ apply, roll back, and match the SQLAlchemy models.
 
 **Cost.** Unit tests run on SQLite for speed, so Postgres-specific behaviour is covered by a
 separate integration test that runs in CI against a real Postgres.
+
+## 7. A job queue in a Postgres table, claimed with SKIP LOCKED
+
+**Context.** Triage ran inside the HTTP request: a slow or failing model call blocked the
+caller, and a provider outage meant lost work. The work needs a queue, and workers that can
+run side by side.
+
+**Decision.** A `jobs` table in the same database. `POST /emails` saves the email and its job
+in one transaction and answers `202`. A worker claims the oldest due job with
+`SELECT ... FOR UPDATE SKIP LOCKED`: the row lock stops two workers from taking the same job,
+and `SKIP LOCKED` makes a worker move on to the next job instead of waiting. The claim is
+committed at once (status `running`), so no transaction stays open during the model call.
+A job left `running` longer than the lock timeout is put back in the queue.
+
+**Cost.** Workers poll the table (every second when idle) instead of being notified;
+Postgres `LISTEN/NOTIFY` could remove that delay. A dedicated broker (Redis, RabbitMQ) would
+handle far more jobs per second, which this project does not need. Because an abandoned job
+comes back, a job can run more than once (at-least-once processing): the worker skips an
+email that is already triaged, so a repeat does not pay for a second model call.
+
+## 8. Retry provider errors with a growing delay, not invalid answers
+
+**Context.** Two kinds of failure reach the worker. The provider does not answer (network,
+quota, server error), or it answers with output that fails validation twice.
+
+**Decision.** Provider errors are retried up to `job_max_attempts` times (4 by default),
+waiting 15 s, then 1 min, then 4 min. An invalid answer was already retried once inside the
+triage with the exact validation error; the same email at temperature 0 would most likely
+fail again, so the job and the email are marked failed at once. An unexpected exception in
+the worker is treated like a provider error, so a bug cannot kill the worker or block the
+queue. Every attempt is logged as a run.
+
+**Cost.** A failed email waits for a person; there is no endpoint yet to queue it again.
+The delays have no random jitter, so many jobs failing together retry together, which only
+matters with many workers.
