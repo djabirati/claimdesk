@@ -44,7 +44,8 @@ class EmailStatus(StrEnum):
 class RunStatus(StrEnum):
     SUCCESS = "success"
     INVALID_OUTPUT = "invalid_output"
-    ERROR = "error"
+    ERROR = "error"  # the provider did not answer, a retry may work (network, quota, 5xx)
+    REJECTED = "rejected"  # the provider refused the request (key, model): a retry would not
 
 
 class JobKind(StrEnum):

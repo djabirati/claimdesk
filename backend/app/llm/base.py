@@ -13,7 +13,16 @@ class LLMResponse:
 
 
 class LLMError(Exception):
-    """The provider failed (network, quota, server error). Not a bad answer: no answer."""
+    """The provider gave no answer. Not a bad answer: no answer at all.
+
+    `retryable` says whether the same call could work later. True for a network failure,
+    a quota or a server error; False when the provider rejects the request itself
+    (invalid key, unknown model, malformed request), which a retry would not fix.
+    """
+
+    def __init__(self, message: str, *, retryable: bool = True) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 class LLMNotConfiguredError(Exception):

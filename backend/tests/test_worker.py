@@ -106,6 +106,24 @@ def test_job_fails_when_no_attempt_is_left(
     assert email.status == EmailStatus.FAILED
 
 
+def test_rejected_request_fails_at_once_without_retry(
+    session_factory: Factory, fake_llm: FakeLLMClient, drain: Drain
+) -> None:
+    # What happened on the first real run: the model was closed to new users (404).
+    fake_llm.script = [LLMError("404 NOT_FOUND: model not available", retryable=False)]
+    email_id = add_email(session_factory)
+
+    drain()
+
+    email, job = load(session_factory, email_id)
+    assert job.status == JobStatus.FAILED
+    assert job.attempts == 1
+    assert "404" in (job.last_error or "")
+    assert email.status == EmailStatus.FAILED
+    assert [run.status for run in email.runs] == ["rejected"]
+    assert len(fake_llm.calls) == 1
+
+
 def test_unexpected_error_keeps_the_worker_alive_and_retries(
     session_factory: Factory, fake_llm: FakeLLMClient, drain: Drain
 ) -> None:

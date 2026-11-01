@@ -50,6 +50,11 @@ def process_job(session: Session, job: Job, llm: LLMClient, settings: Settings) 
             log.warning("job %s: provider error, retry at %s: %s", job.id, job.run_after, run.error)
         else:
             log.error("job %s: provider error, no attempt left: %s", job.id, run.error)
+    elif run.status == RunStatus.REJECTED:
+        # The provider refused the request (invalid key, unknown model): every retry would
+        # fail the same way. Fail now so the error is visible at once.
+        mark_failed(session, job, run.error)
+        log.error("job %s: request rejected by the provider: %s", job.id, run.error)
     else:
         # The model answered, but twice with invalid output (classify() already retried once
         # with the validation error). The same email would most likely fail the same way.
