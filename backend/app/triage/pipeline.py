@@ -1,21 +1,14 @@
-from decimal import Decimal
-
 from sqlalchemy.orm import Session
 
 from app.config import Settings
 from app.enums import EmailStatus, RunStatus
 from app.llm.base import LLMClient
+from app.llm.cost import estimate_cost
 from app.models import Email, TriageRun
 from app.triage.classifier import classify
 from app.triage.prompts import PROMPT_VERSION
 
-
-def estimate_cost(input_tokens: int, output_tokens: int, settings: Settings) -> Decimal:
-    cost = (
-        input_tokens * settings.llm_input_price_per_mtok
-        + output_tokens * settings.llm_output_price_per_mtok
-    ) / 1_000_000
-    return Decimal(str(round(cost, 6)))
+__all__ = ["estimate_cost", "triage_email"]
 
 
 def triage_email(session: Session, email: Email, llm: LLMClient, settings: Settings) -> TriageRun:

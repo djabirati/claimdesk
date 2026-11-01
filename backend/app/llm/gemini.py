@@ -1,9 +1,20 @@
+from typing import Any
+
 import httpx
 from google import genai
 from google.genai import errors, types
 from pydantic import BaseModel
 
-from app.llm.base import LLMError, LLMResponse
+from app.llm.base import (
+    LLMError,
+    LLMResponse,
+    Message,
+    ModelTurn,
+    ToolCall,
+    ToolResults,
+    ToolSpec,
+    UserMessage,
+)
 
 # HTTP codes worth retrying: timeout, quota or rate limit, and server-side errors.
 # Other 4xx codes (invalid key, unknown model, malformed request) fail the same way every time.
@@ -12,6 +23,12 @@ RETRYABLE_STATUS = {408, 429}
 
 def is_retryable(status_code: int) -> bool:
     return status_code in RETRYABLE_STATUS or status_code >= 500
+
+
+def _thinking(thinking_level: str | None) -> types.ThinkingConfig | None:
+    if not thinking_level:
+        return None
+    return types.ThinkingConfig(thinking_level=types.ThinkingLevel(thinking_level.upper()))
 
 
 def build_config(
@@ -23,17 +40,77 @@ def build_config(
     degrade answers). Answers can therefore vary from one run to the next, which is what
     the evaluation suite measures (step 3).
     """
-    thinking = (
-        types.ThinkingConfig(thinking_level=types.ThinkingLevel(thinking_level.upper()))
-        if thinking_level
-        else None
-    )
     return types.GenerateContentConfig(
         system_instruction=system,
         response_mime_type="application/json",
         response_schema=schema,
-        thinking_config=thinking,
+        thinking_config=_thinking(thinking_level),
     )
+
+
+def build_tools_config(
+    *, system: str, tools: list[ToolSpec], thinking_level: str | None
+) -> types.GenerateContentConfig:
+    """Request settings for one step of the agent: the tools are declared, never run here."""
+    declarations = [
+        types.FunctionDeclaration(
+            name=tool.name,
+            description=tool.description,
+            # A tool without arguments is declared without a schema rather than with an
+            # empty object, which some schema validators refuse.
+            parameters_json_schema=tool.parameters if tool.parameters.get("properties") else None,
+        )
+        for tool in tools
+    ]
+    return types.GenerateContentConfig(
+        system_instruction=system,
+        tools=[types.Tool(function_declarations=declarations)],
+        # The SDK can run Python functions by itself; our tools are declarations only, and
+        # this makes sure the agent loop is the one place where a tool runs.
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+        thinking_config=_thinking(thinking_level),
+    )
+
+
+def to_contents(messages: list[Message]) -> list[types.Content]:
+    """Convert the conversation to Gemini's format."""
+    contents: list[types.Content] = []
+    for message in messages:
+        if isinstance(message, UserMessage):
+            contents.append(types.Content(role="user", parts=[types.Part(text=message.text)]))
+        elif isinstance(message, ModelTurn):
+            if isinstance(message.raw, types.Content):
+                # Sent back exactly as received, with its thought signatures.
+                contents.append(message.raw)
+            else:
+                parts = [types.Part(text=message.text)] if message.text else []
+                parts += [
+                    types.Part(
+                        function_call=types.FunctionCall(id=c.id, name=c.name, args=c.arguments)
+                    )
+                    for c in message.tool_calls
+                ]
+                contents.append(types.Content(role="model", parts=parts))
+        elif isinstance(message, ToolResults):
+            parts = [
+                types.Part(
+                    function_response=types.FunctionResponse(
+                        id=r.call.id, name=r.call.name, response=r.content
+                    )
+                )
+                for r in message.results
+            ]
+            contents.append(types.Content(role="user", parts=parts))
+    return contents
+
+
+def _token_counts(response: types.GenerateContentResponse) -> tuple[int, int]:
+    usage = response.usage_metadata
+    if usage is None:
+        return 0, 0
+    # "Thinking" tokens are billed as output tokens, so they count in the cost.
+    output = (usage.candidates_token_count or 0) + (usage.thoughts_token_count or 0)
+    return usage.prompt_token_count or 0, output
 
 
 class GeminiClient:
@@ -57,11 +134,12 @@ class GeminiClient:
         self.thinking_level = thinking_level
         self.timeout_seconds = timeout_seconds
 
-    def generate_json(self, *, system: str, prompt: str, schema: type[BaseModel]) -> LLMResponse:
-        config = build_config(system=system, schema=schema, thinking_level=self.thinking_level)
+    def _generate(
+        self, contents: Any, config: types.GenerateContentConfig
+    ) -> types.GenerateContentResponse:
         try:
-            response = self._client.models.generate_content(
-                model=self.model, contents=prompt, config=config
+            return self._client.models.generate_content(
+                model=self.model, contents=contents, config=config
             )
         except errors.APIError as exc:  # quota, invalid key, unknown model, server error...
             raise LLMError(f"Gemini API error: {exc}", retryable=is_retryable(exc.code)) from exc
@@ -72,15 +150,46 @@ class GeminiClient:
         except httpx.HTTPError as exc:  # network failure, proxy refusal
             raise LLMError(f"Network error calling Gemini: {exc}", retryable=True) from exc
 
-        usage = response.usage_metadata
-        input_tokens = (usage.prompt_token_count or 0) if usage else 0
-        # "Thinking" tokens are billed as output tokens, so they count in the cost.
-        output_tokens = (
-            (usage.candidates_token_count or 0) + (usage.thoughts_token_count or 0) if usage else 0
-        )
+    def generate_json(self, *, system: str, prompt: str, schema: type[BaseModel]) -> LLMResponse:
+        config = build_config(system=system, schema=schema, thinking_level=self.thinking_level)
+        response = self._generate(prompt, config)
+        input_tokens, output_tokens = _token_counts(response)
         return LLMResponse(
             text=response.text or "",
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             model=self.model,
+        )
+
+    def generate_with_tools(
+        self, *, system: str, messages: list[Message], tools: list[ToolSpec]
+    ) -> ModelTurn:
+        config = build_tools_config(system=system, tools=tools, thinking_level=self.thinking_level)
+        response = self._generate(to_contents(messages), config)
+        candidate = response.candidates[0] if response.candidates else None
+        content = candidate.content if candidate else None
+        if content is None or not content.parts:
+            # For example MALFORMED_FUNCTION_CALL: the model produced an unusable answer.
+            # Sampling is not fixed, so another attempt may well work.
+            reason = candidate.finish_reason if candidate else "no candidate"
+            raise LLMError(f"Gemini returned no content (finish reason: {reason})")
+
+        text = "".join(p.text for p in content.parts if p.text and not p.thought)
+        calls = [
+            ToolCall(
+                name=p.function_call.name or "",
+                arguments=dict(p.function_call.args or {}),
+                id=p.function_call.id,
+            )
+            for p in content.parts
+            if p.function_call
+        ]
+        input_tokens, output_tokens = _token_counts(response)
+        return ModelTurn(
+            text=text.strip(),
+            tool_calls=calls,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            model=self.model,
+            raw=content,
         )

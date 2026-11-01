@@ -1,6 +1,7 @@
 import re
 from datetime import datetime
 from decimal import Decimal
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -98,6 +99,50 @@ class JobOut(BaseModel):
     finished_at: datetime | None
 
 
+class AgentRunOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    model: str
+    prompt_version: str
+    status: str
+    steps: int
+    input_tokens: int
+    output_tokens: int
+    latency_ms: int
+    cost_usd: Decimal
+    note: str | None
+    flags: list[str]
+    trace: list[dict[str, Any]]
+    error: str | None
+    created_at: datetime | None
+
+
+class ActionOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    email_id: int
+    agent_run_id: int
+    kind: str
+    status: str
+    order_id: str | None
+    payload: dict[str, Any]
+    rationale: str | None
+    created_at: datetime | None
+    decided_by: str | None
+    decided_at: datetime | None
+    decision_note: str | None
+    executed_at: datetime | None
+    result: dict[str, Any] | None
+
+
+class DecisionIn(BaseModel):
+    # No authentication yet: the reviewer's name is given, not proven (see the README).
+    reviewer: str = Field(min_length=2, max_length=120)
+    note: str | None = Field(default=None, max_length=1000)
+
+
 class EmailOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -114,3 +159,5 @@ class EmailOut(BaseModel):
 class EmailDetail(EmailOut):
     runs: list[TriageRunOut]
     jobs: list[JobOut]
+    agent_runs: list[AgentRunOut]
+    actions: list[ActionOut]

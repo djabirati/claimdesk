@@ -4,11 +4,14 @@
 
 An LLM-powered triage service for delivery-dispute emails, built for an after-sales team.
 Every incoming email is classified, its identifiers are extracted and checked against the
-text, every model call is logged with its cost, and anything uncertain goes to a person.
+text, and anything uncertain goes to a person. For each claim, an agent checks the order and
+the carrier tracking, then proposes the actions (refund, replacement, carrier claim, reply):
+a person approves each one before it runs. Every model call and tool call is logged with its
+cost.
 
-> **Status: step 2a of 5.** Triage pipeline, API, run log, CI, and a Postgres job queue with
-> a background worker are done. The agent with tools, human approval, evals and the dashboard
-> are next (see [Roadmap](#roadmap)).
+> **Status: step 2b of 5.** Triage pipeline, job queue and worker, and the agent with human
+> approval are done. MCP server, evals and the dashboard are next (see [Roadmap](#roadmap)).
+> The agent's quality has not been measured yet: that is step 3.
 
 ## Why this project
 
@@ -45,11 +48,15 @@ flowchart LR
    The claim is committed right away, and the triage ends its read transaction before the
    model call, so no transaction stays open while waiting for the model.
 3. **Only temporary provider errors are retried** (network, timeout, quota, server error),
-   with a growing delay. Each model call has a timeout (90 s), kept below the lock timeout. A rejected request (invalid key, unknown model) fails at once, and so does
-   an answer that was invalid twice: retrying would give the same result.
+   with a growing delay. Each model call has a timeout (90 s), kept below the lock timeout
+   (15 min). A rejected request (invalid key, unknown model) fails at once, and so does an
+   answer that was invalid twice: retrying would give the same result.
 4. **Abandoned jobs come back.** A job still `running` after the lock timeout (worker crashed
    or killed) goes back to the queue; its attempt counts, so it cannot loop forever. A job can
    therefore run twice, and the worker skips an email that is already triaged.
+5. **A claim gets a second job.** When the triage finds a claim (damaged, late, lost, wrong
+   item, refund request), an `agent` job is queued in the same commit that marks the triage
+   done. Spam, thank-you notes and other emails stop at the triage.
 
 ### Triage of one email
 
@@ -79,6 +86,44 @@ flowchart LR
 5. **Run log.** Each run stores the model, prompt version, attempts, tokens, latency,
    estimated cost, flags, and the raw output when it fails.
 
+### The agent: it checks, it proposes, a person decides
+
+```mermaid
+flowchart LR
+    J[Agent job] --> M["Model call<br/>with 7 tools"]
+    M -->|tool calls| T{"Tool"}
+    T -->|read| R["get_order, list_customer_orders,<br/>track_parcel (sender's orders only)"]
+    T -->|propose| P["propose_refund, _replacement,<br/>_carrier_claim, _reply<br/>(validated, kept in memory)"]
+    R --> M
+    P --> M
+    M -->|"text only: note<br/>for the reviewer"| S[("Postgres<br/>run + trace + proposals")]
+    S --> Q["GET /actions?status=proposed"]
+    Q -->|approve| X["executed (simulated)"]
+    Q -->|reject| N[never runs]
+```
+
+1. **A loop written by hand.** One step is one model call with the tool declarations. The
+   loop runs the tool calls the model asks for, sends the results back, and stops when the
+   model answers with text only (its note for the reviewer) or after 8 steps.
+2. **Two kinds of tools, none that acts.** Read tools look up orders and the (simulated)
+   carrier tracking. Propose tools record a proposal. Executing an approved action is done by
+   `app/actions.py`, which the agent never imports; a test checks it.
+3. **Least privilege.** Every tool only sees the orders of the email's sender. An injected
+   "refund order ML-104206" from another address gets "not found".
+4. **Validation in code, errors back to the model.** A refund above the order total, a second
+   reply, an unknown tool or a wrong argument returns an error to the model, which can correct
+   its call. The sample email that says "refund 500 euros" for a 27.80 EUR lamp ends with a
+   proposal of 27.80 EUR at most.
+5. **All or nothing.** Proposals are saved at the end of the run, with the run, in one
+   transaction. A run stopped by a provider error keeps its log but no proposal, so the retry
+   cannot duplicate a refund.
+6. **A person decides.** `POST /actions/{id}/approve` executes the action (simulated: nothing
+   is paid, shipped or sent) and `reject` closes it. Approval is a compare-and-set
+   (`UPDATE ... WHERE status = 'proposed'`): two people clicking at once execute it once.
+7. **Trace.** Each agent run stores its steps, tokens, cost, flags (`step_limit`,
+   `no_reply_proposed`, `tool_errors`) and one trace entry per tool call: arguments, result,
+   duration.
+
 ## Design decisions
 
 The short version is below; the reasoning is in [docs/decisions.md](docs/decisions.md).
@@ -94,6 +139,9 @@ The short version is below; the reasoning is in [docs/decisions.md](docs/decisio
 | The job queue is a Postgres table | No broker to run. The email and its job are saved in one transaction. |
 | Retry temporary provider errors only, with backoff | A quota or network error often passes; an unknown model or an invalid answer comes back the same. |
 | No temperature on Gemini 3 | Google advises against it. Answers may vary, which the evaluation suite measures. |
+| Agent loop written by hand, no framework | One readable file, tested with the fake client; the step limit and the trace are explicit. |
+| The agent proposes, a person approves | The model can be wrong or manipulated; the only path to an action goes through a person. |
+| Tools scoped to the sender's orders | An email cannot make the agent read or act on another customer's order. |
 
 ## Roadmap
 
@@ -102,8 +150,9 @@ The short version is below; the reasoning is in [docs/decisions.md](docs/decisio
 - [ ] **Step 2: agent and human approval.**
   - [x] **2a.** Job queue in Postgres and background worker, with retries and recovery of
     abandoned jobs.
-  - [ ] **2b.** An agent that calls read-only tools (order lookup, carrier tracking), and
-    actions (refund, reply) that it can only *propose*: a person approves them before they run.
+  - [x] **2b.** An agent that calls read-only tools (order lookup, carrier tracking), and
+    actions (refund, replacement, carrier claim, reply) that it can only *propose*: a person
+    approves them before they run.
   - [ ] **2c.** The tools exposed through an MCP server, and similar past cases with pgvector.
 - [ ] **Step 3: evaluations.** Golden dataset, deterministic checks first, LLM-as-judge with a
   written rubric for free text, pass rate over repeated runs, prompt-injection cases, and a
@@ -130,12 +179,17 @@ curl -X POST localhost:8000/emails -H "Content-Type: application/json" -d '{
 }'
 ```
 
-The answer has status `received` and a queued job. A second later, the worker has triaged it:
+The answer has status `received` and a queued job. A few seconds later the worker has
+triaged it, and since it is a claim, the agent has proposed actions:
 
 ```bash
-curl localhost:8000/emails/<id>   # id from the answer above: status, triage, runs, jobs
+curl localhost:8000/emails/<id>              # status, triage, runs, jobs, agent run, actions
+curl "localhost:8000/actions?status=proposed" # the approval queue
+curl -X POST localhost:8000/actions/<action id>/approve \
+  -H "Content-Type: application/json" -d '{"reviewer": "Djabi"}'
 ```
 
+To fill the queue with the 24 sample emails: `cd backend && python -m scripts.send_samples`.
 More workers: `docker compose up --scale worker=3`.
 
 ### Local development
@@ -169,24 +223,34 @@ python -m scripts.try_samples
 |---|---|---|
 | `POST` | `/emails` | Store an email and queue it for triage. Returns `202` with status `received`. |
 | `GET` | `/emails?status=needs_review` | List emails, optionally filtered by status. |
-| `GET` | `/emails/{id}` | One email with its runs (model calls) and jobs (queue history). |
+| `GET` | `/emails/{id}` | One email with its triage runs, jobs, agent runs (with trace) and proposed actions. |
+| `GET` | `/actions?status=proposed` | The approval queue, oldest first. |
+| `GET` | `/actions/{id}` | One proposed action. |
+| `POST` | `/actions/{id}/approve` | Approve and execute (simulated). Body: `reviewer`, optional `note`. `409` if already decided. |
+| `POST` | `/actions/{id}/reject` | Reject: the action never runs. Same body. `409` if already decided. |
 | `GET` | `/health` | Liveness check. |
+
+There is no authentication yet: the reviewer's name is given, not proven.
 
 ## Project layout
 
 ```
 backend/
   app/
-    api/         FastAPI routes
-    llm/         LLMClient interface, Gemini client, fake client for tests
+    api/         FastAPI routes: emails, actions (approval queue)
+    llm/         LLMClient interface (JSON and tool calling), Gemini client, fake client
     triage/      extraction, prompt, classifier and guards, pipeline
+    agent/       the agent: loop, tools, prompt
+    actions.py   approve, reject, execute (simulated): the human side
+    carrier.py   simulated carrier tracking API
     jobs.py      the Postgres job queue: enqueue, claim, retry, recover abandoned jobs
-    worker.py    background worker (python -m app.worker)
-    models.py    SQLAlchemy tables: orders, emails, triage_runs, jobs
+    worker.py    background worker (python -m app.worker): triage and agent jobs
+    models.py    SQLAlchemy tables: orders, emails, triage_runs, jobs, agent_runs, actions
     schemas.py   Pydantic models, including the LLM response schema
   alembic/       database migrations
-  scripts/       seed data, sample run
-  tests/         unit, API, worker, and Postgres tests (migrations, queue locking)
+  scripts/       seed data, sample run, send the samples to the API
+  tests/         unit, API, worker, agent, Gemini client (local stand-in server),
+                 and Postgres tests (migrations, queue locking, concurrent approvals)
 data/
   seed/          fictional orders
   samples/       24 fictional emails with expected labels

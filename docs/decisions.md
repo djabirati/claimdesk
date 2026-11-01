@@ -92,7 +92,7 @@ and `SKIP LOCKED` makes a worker move on to the next job instead of waiting. The
 committed at once (status `running`), and the triage ends the transaction opened by reading
 the email before it calls the model, so no transaction stays open while waiting (a Postgres
 test checks that no connection is `idle in transaction` during the call). A job left
-`running` longer than the lock timeout is put back in the queue.
+`running` longer than the lock timeout (15 min) is put back in the queue.
 
 **Cost.** Workers poll the table (every second when idle) instead of being notified;
 Postgres `LISTEN/NOTIFY` could remove that delay. A dedicated broker (Redis, RabbitMQ) would
@@ -117,9 +117,9 @@ the worker or block the queue. Every attempt is logged as a run.
 
 Each model call has a timeout (`llm_timeout_seconds`, 90 s): the SDK sets none, and a call
 that never returns would block the worker for good. A timeout counts as a temporary error.
-The timeout times the number of calls in one triage must stay below the lock timeout, or a
-job still waiting for the model would be handed to a second worker; the settings refuse
-values that break this.
+The timeout times the number of calls in one job (2 for a triage, up to 8 for an agent run)
+must stay below the lock timeout, or a job still waiting for the model would be handed to a
+second worker; the settings refuse values that break this.
 
 The split came from the first run with a real key: Google had closed `gemini-2.5-flash` to
 new users and answered 404, and the worker kept retrying a call that could never work.
@@ -143,3 +143,57 @@ level is a setting (`LLM_THINKING_LEVEL`), left empty for a Gemini 2.5 model.
 **Cost.** Answers can vary from one run to the next for the same email. The design already
 assumes this: the code checks every answer, and the evaluation suite (step 3) measures the
 pass rate over repeated runs instead of trusting a single one.
+
+## 10. An agent loop written by hand, behind the same LLM interface
+
+**Context.** Step 2 needs an agent: the model calls tools (order lookup, tracking), reads the
+results, and decides what to propose. Frameworks (LangGraph, Google ADK) provide this loop.
+
+**Decision.** A loop in one function, `run_agent` in `app/agent/loop.py`. One step is one model call;
+the loop runs the tool calls, sends the results back, and stops when the model answers with
+text only, or after `agent_max_steps` (8). The `LLMClient` interface gains one method,
+`generate_with_tools`, with provider-neutral messages; the Gemini client keeps the model's
+own message (`raw`) and sends it back unchanged, because Gemini 3 rejects a conversation
+whose function calls lost their thought signatures. The SDK's automatic function calling is
+turned off, so the loop is the only place where a tool runs.
+
+**Cost.** No ready-made features: no graph of states, no built-in memory, no parallel
+branches. This agent needs none of them, and in exchange every step is visible, the step
+limit is one line, and the whole agent is tested with the fake client, for free. Another
+provider needs its own conversion of the messages.
+
+## 11. Tools that read or propose, scoped to the sender
+
+**Context.** An agent that can refund is an agent that an email can talk into refunding.
+Prompt rules lower that risk; they do not remove it (decision 5).
+
+**Decision.** The agent has two kinds of tools only. Read tools see the orders of the
+email's sender and nothing else: an order or parcel of another customer is "not found",
+whatever the email says. Propose tools record a proposal after checks in code: the order
+belongs to the sender, a refund is above 0 and at most the order total, each kind of action
+at most once. A failed check, an unknown tool or a wrong argument returns an error to the
+model, which can correct its call, and the run gets a `tool_errors` flag. Executing an
+action is done by `app/actions.py`, which no agent module imports (a test reads the imports).
+
+**Cost.** A customer who writes from another address than the one on the order gets no
+proposal: the agent finds no order and proposes a reply asking for the order number, and a
+person handles the rest. That is the safe direction to be wrong in.
+
+## 12. Proposals saved in one go, approval as a compare-and-set
+
+**Context.** An agent run can stop half-way (provider error) and be retried. Two people can
+look at the approval queue at the same time.
+
+**Decision.** Proposals stay in memory during the run and are saved at the end, with the
+run, in one transaction. A run stopped by an error saves its log but no proposal, so the
+retry cannot propose a second refund. A run stopped by the step limit keeps its proposals,
+with a flag: they all wait for a person anyway. Approval is one statement,
+`UPDATE actions SET status = 'approved' ... WHERE id = :id AND status = 'proposed'`: if two
+people approve at once, Postgres lets one update through and the other changes no row and
+gets a 409. A Postgres test runs the two approvals in parallel threads.
+
+**Cost.** Execution is simulated: nothing is paid, shipped or sent. With real systems, the
+call would carry the action id as an idempotency key, so a crash between "approved" and
+"executed" could be retried without paying twice; an action stuck in `approved` is visible
+but nothing retries it yet. There is no authentication: the reviewer's name is given, not
+proven.

@@ -69,14 +69,21 @@ def mark_done(session: Session, job: Job, *, now: datetime | None = None) -> Non
     session.commit()
 
 
+def _give_up(job: Job, error: str | None, now: datetime) -> None:
+    job.status = JobStatus.FAILED
+    job.last_error = error
+    job.finished_at = now
+    # A failed triage leaves an email nobody has sorted: mark it failed so a person sees
+    # it. A failed agent run leaves a valid triage, and the failed job is visible enough.
+    if job.kind == JobKind.TRIAGE:
+        job.email.status = EmailStatus.FAILED
+
+
 def mark_failed(
     session: Session, job: Job, error: str | None, *, now: datetime | None = None
 ) -> None:
-    """Give up on a job. Its email is marked failed so that a person sees it."""
-    job.status = JobStatus.FAILED
-    job.last_error = error
-    job.finished_at = now or utcnow()
-    job.email.status = EmailStatus.FAILED
+    """Give up on a job."""
+    _give_up(job, error, now or utcnow())
     session.commit()
 
 
@@ -132,14 +139,12 @@ def requeue_stale_jobs(
     error = "Lock expired: the worker stopped while running this job."
     for job in stale:
         if job.attempts >= job.max_attempts:
-            job.status = JobStatus.FAILED
-            job.finished_at = now
-            job.email.status = EmailStatus.FAILED
+            _give_up(job, error, now)
         else:
             job.status = JobStatus.QUEUED
             job.run_after = now
             job.locked_by = None
             job.locked_at = None
-        job.last_error = error
+            job.last_error = error
     session.commit()
     return len(stale)
