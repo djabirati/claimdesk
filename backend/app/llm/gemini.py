@@ -37,10 +37,25 @@ def build_config(
 
 
 class GeminiClient:
-    def __init__(self, api_key: str, model: str, thinking_level: str | None = None) -> None:
-        self._client = genai.Client(api_key=api_key)
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        thinking_level: str | None = None,
+        timeout_seconds: float = 90,
+        base_url: str | None = None,  # tests point the client at a local server
+    ) -> None:
+        self._client = genai.Client(
+            api_key=api_key,
+            # Milliseconds. The SDK sets no limit by default; it also does not retry
+            # unless asked, so retries are only the worker's (one place, one policy).
+            http_options=types.HttpOptions(
+                timeout=round(timeout_seconds * 1000), base_url=base_url
+            ),
+        )
         self.model = model
         self.thinking_level = thinking_level
+        self.timeout_seconds = timeout_seconds
 
     def generate_json(self, *, system: str, prompt: str, schema: type[BaseModel]) -> LLMResponse:
         config = build_config(system=system, schema=schema, thinking_level=self.thinking_level)
@@ -50,7 +65,11 @@ class GeminiClient:
             )
         except errors.APIError as exc:  # quota, invalid key, unknown model, server error...
             raise LLMError(f"Gemini API error: {exc}", retryable=is_retryable(exc.code)) from exc
-        except httpx.HTTPError as exc:  # network failure, timeout, proxy refusal
+        except httpx.TimeoutException as exc:
+            raise LLMError(
+                f"Gemini did not answer within {self.timeout_seconds:g} s", retryable=True
+            ) from exc
+        except httpx.HTTPError as exc:  # network failure, proxy refusal
             raise LLMError(f"Network error calling Gemini: {exc}", retryable=True) from exc
 
         usage = response.usage_metadata

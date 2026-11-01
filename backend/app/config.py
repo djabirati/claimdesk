@@ -1,7 +1,7 @@
 from functools import lru_cache
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     # Sorting an email does not need long reasoning, and thinking tokens are billed.
     # Leave empty for a Gemini 2.5 model, which does not accept this setting.
     llm_thinking_level: Literal["low", "medium", "high"] | None = "low"
+    # Longest wait for one model call. Without it a call that never returns blocks the
+    # worker for good (the SDK sets no limit). Calls of 40 s were seen on the free tier.
+    llm_timeout_seconds: float = 90
 
     # Used only to estimate the cost of each run (USD per million tokens).
     # Gemini 3.8 Flash paid-tier prices; Google announced they double on 1 January 2027
@@ -45,6 +48,18 @@ class Settings(BaseSettings):
     def empty_means_none(cls, value: object) -> object:
         # LLM_THINKING_LEVEL= (empty) in .env means "do not send the setting".
         return None if value == "" else value
+
+    @model_validator(mode="after")
+    def triage_ends_before_the_lock_expires(self) -> Self:
+        # One triage makes up to triage_max_attempts calls. If they can last longer than
+        # the lock timeout, a job still waiting for the model is handed to a second worker.
+        longest_triage = self.llm_timeout_seconds * self.triage_max_attempts
+        if longest_triage >= self.job_lock_timeout_seconds:
+            raise ValueError(
+                f"llm_timeout_seconds x triage_max_attempts ({longest_triage:g} s) must be "
+                f"below job_lock_timeout_seconds ({self.job_lock_timeout_seconds:g} s)"
+            )
+        return self
 
 
 @lru_cache

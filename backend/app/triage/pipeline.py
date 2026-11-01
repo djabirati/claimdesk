@@ -24,10 +24,15 @@ def triage_email(session: Session, email: Email, llm: LLMClient, settings: Setti
     A successful run updates the email. A failed run leaves the email status as it is:
     the worker decides whether to try again later or to give up (see app/worker.py).
     """
+    sender, subject, body = email.sender, email.subject, email.body
+    # End the transaction opened by reading the email before the model call, which can
+    # take tens of seconds. Left open, it would keep the connection "idle in transaction".
+    session.commit()
+
     outcome = classify(
-        sender=email.sender,
-        subject=email.subject,
-        body=email.body,
+        sender=sender,
+        subject=subject,
+        body=body,
         llm=llm,
         max_attempts=settings.triage_max_attempts,
     )

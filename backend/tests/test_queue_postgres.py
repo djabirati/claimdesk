@@ -1,4 +1,5 @@
-"""The queue's locking on a real Postgres (SQLite ignores FOR UPDATE SKIP LOCKED).
+"""The queue and the worker on a real Postgres (SQLite ignores FOR UPDATE SKIP LOCKED
+and has no view of open transactions).
 
 Runs only when TEST_DATABASE_URL points to a disposable database already migrated with
 `alembic upgrade head` (CI does this). Skipped otherwise.
@@ -13,9 +14,13 @@ import pytest
 from sqlalchemy import create_engine, delete, text
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.enums import EmailStatus, JobKind
+from app.config import Settings
+from app.enums import EmailStatus, JobKind, JobStatus
 from app.jobs import claim_next_job, enqueue, utcnow
-from app.models import Email
+from app.llm.fake import FakeLLMClient
+from app.models import Email, Job
+from app.worker import run_once
+from tests.conftest import triage_json
 
 DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
 pytestmark = pytest.mark.skipif(not DATABASE_URL, reason="TEST_DATABASE_URL not set")
@@ -93,3 +98,32 @@ def test_concurrent_workers_never_take_the_same_job(factory: sessionmaker[Sessio
 
     # Every job was taken exactly once.
     assert sorted(claimed) == sorted(job_ids)
+
+
+def test_no_transaction_stays_open_during_the_model_call(factory: sessionmaker[Session]) -> None:
+    # A model call can take tens of seconds. A transaction left open meanwhile keeps a
+    # Postgres connection "idle in transaction" (it holds a snapshot and blocks clean-up).
+    (job_id,) = add_jobs(factory, 1)
+    assert DATABASE_URL is not None
+    probe = create_engine(DATABASE_URL)
+    idle_in_transaction: list[int] = []
+
+    def answer(prompt: str) -> str:
+        # Runs while the worker waits for the "model": look at the server's connections.
+        with probe.connect() as conn:
+            count = conn.execute(
+                text(
+                    "SELECT count(*) FROM pg_stat_activity "
+                    "WHERE datname = current_database() AND state = 'idle in transaction'"
+                )
+            ).scalar_one()
+        idle_in_transaction.append(count)
+        return triage_json()
+
+    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert run_once(factory, FakeLLMClient(script=answer), settings, worker_id="worker-1")
+    probe.dispose()
+
+    assert idle_in_transaction == [0]
+    with factory() as session:
+        assert session.get_one(Job, job_id).status == JobStatus.DONE

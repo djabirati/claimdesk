@@ -42,9 +42,10 @@ flowchart LR
    model call never blocks the caller, and an email is never stored without its job.
 2. **Workers claim jobs with `SELECT ... FOR UPDATE SKIP LOCKED`.** Several workers can run
    at once: each job goes to one of them, and none waits on a row another is claiming.
-   The claim is committed right away, so no transaction stays open during the model call.
-3. **Only temporary provider errors are retried** (network, quota, server error), with a
-   growing delay. A rejected request (invalid key, unknown model) fails at once, and so does
+   The claim is committed right away, and the triage ends its read transaction before the
+   model call, so no transaction stays open while waiting for the model.
+3. **Only temporary provider errors are retried** (network, timeout, quota, server error),
+   with a growing delay. Each model call has a timeout (90 s), kept below the lock timeout. A rejected request (invalid key, unknown model) fails at once, and so does
    an answer that was invalid twice: retrying would give the same result.
 4. **Abandoned jobs come back.** A job still `running` after the lock timeout (worker crashed
    or killed) goes back to the queue; its attempt counts, so it cannot loop forever. A job can

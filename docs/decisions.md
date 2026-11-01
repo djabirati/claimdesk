@@ -89,8 +89,10 @@ run side by side.
 in one transaction and answers `202`. A worker claims the oldest due job with
 `SELECT ... FOR UPDATE SKIP LOCKED`: the row lock stops two workers from taking the same job,
 and `SKIP LOCKED` makes a worker move on to the next job instead of waiting. The claim is
-committed at once (status `running`), so no transaction stays open during the model call.
-A job left `running` longer than the lock timeout is put back in the queue.
+committed at once (status `running`), and the triage ends the transaction opened by reading
+the email before it calls the model, so no transaction stays open while waiting (a Postgres
+test checks that no connection is `idle in transaction` during the call). A job left
+`running` longer than the lock timeout is put back in the queue.
 
 **Cost.** Workers poll the table (every second when idle) instead of being notified;
 Postgres `LISTEN/NOTIFY` could remove that delay. A dedicated broker (Redis, RabbitMQ) would
@@ -113,8 +115,16 @@ email would most likely fail again, so the job and the email are marked failed a
 unexpected exception in the worker is treated like a temporary error, so a bug cannot kill
 the worker or block the queue. Every attempt is logged as a run.
 
+Each model call has a timeout (`llm_timeout_seconds`, 90 s): the SDK sets none, and a call
+that never returns would block the worker for good. A timeout counts as a temporary error.
+The timeout times the number of calls in one triage must stay below the lock timeout, or a
+job still waiting for the model would be handed to a second worker; the settings refuse
+values that break this.
+
 The split came from the first run with a real key: Google had closed `gemini-2.5-flash` to
 new users and answered 404, and the worker kept retrying a call that could never work.
+The same run took 39 s for one email on the free tier, which showed the missing timeout and a
+transaction left open during the call.
 
 **Cost.** A failed email waits for a person; there is no endpoint yet to queue it again.
 The delays have no random jitter, so many jobs failing together retry together, which only
