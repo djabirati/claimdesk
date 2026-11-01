@@ -19,7 +19,11 @@ def estimate_cost(input_tokens: int, output_tokens: int, settings: Settings) -> 
 
 
 def triage_email(session: Session, email: Email, llm: LLMClient, settings: Settings) -> TriageRun:
-    """Run triage on a stored email, record the run, update the email. Commits."""
+    """Run triage on a stored email and record the run. Commits.
+
+    A successful run updates the email. A failed run leaves the email status as it is:
+    the worker decides whether to try again later or to give up (see app/worker.py).
+    """
     outcome = classify(
         sender=email.sender,
         subject=email.subject,
@@ -48,8 +52,6 @@ def triage_email(session: Session, email: Email, llm: LLMClient, settings: Setti
         email.triage = outcome.result.model_dump(mode="json")
         email.flags = outcome.flags
         email.status = EmailStatus.NEEDS_REVIEW if outcome.needs_review else EmailStatus.TRIAGED
-    else:
-        email.status = EmailStatus.FAILED
 
     session.commit()
     session.refresh(run)

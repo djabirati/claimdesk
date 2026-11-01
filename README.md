@@ -6,8 +6,9 @@ An LLM-powered triage service for delivery-dispute emails, built for an after-sa
 Every incoming email is classified, its identifiers are extracted and checked against the
 text, every model call is logged with its cost, and anything uncertain goes to a person.
 
-> **Status: step 1 of 5.** Triage pipeline, API, run log and CI are done.
-> The agent with tools, human approval, evals and the dashboard are next (see [Roadmap](#roadmap)).
+> **Status: step 2a of 5.** Triage pipeline, API, run log, CI, and a Postgres job queue with
+> a background worker are done. The agent with tools, human approval, evals and the dashboard
+> are next (see [Roadmap](#roadmap)).
 
 ## Why this project
 
@@ -20,11 +21,39 @@ every run, and (next) evaluations that block a regression before it ships.
 All data in this repository is fictional: the retailer (Maison Lumen), the carriers, the
 customers and the orders.
 
-## How it works (step 1)
+## How it works
+
+### Receiving an email: a queue and a worker
 
 ```mermaid
 flowchart LR
-    A[POST /emails] --> B["Deterministic extraction<br/>order ids, tracking numbers, amounts"]
+    A[POST /emails] -->|"one transaction"| Q[("Postgres<br/>email + job")]
+    A -->|"202, status received"| C[Caller]
+    W1[Worker] -->|"claim: FOR UPDATE SKIP LOCKED"| Q
+    W2[Worker] -->|claim| Q
+    W1 --> T[Triage]
+    T -->|success| D[job done]
+    T -->|"provider error"| R["retry later<br/>15 s, 1 min, 4 min"]
+    T -->|"invalid output twice"| F[job failed]
+```
+
+1. **The API does not call the model.** `POST /emails` stores the email and a `triage` job
+   in the same transaction, then answers `202` with status `received`. A slow or failing
+   model call never blocks the caller, and an email is never stored without its job.
+2. **Workers claim jobs with `SELECT ... FOR UPDATE SKIP LOCKED`.** Several workers can run
+   at once: each job goes to one of them, and none waits on a row another is claiming.
+   The claim is committed right away, so no transaction stays open during the model call.
+3. **Only provider errors are retried**, with a growing delay. An invalid answer was already
+   retried once with the validation error, so the email is marked failed instead.
+4. **Abandoned jobs come back.** A job still `running` after the lock timeout (worker crashed
+   or killed) goes back to the queue; its attempt counts, so it cannot loop forever. A job can
+   therefore run twice, and the worker skips an email that is already triaged.
+
+### Triage of one email
+
+```mermaid
+flowchart LR
+    A[Job] --> B["Deterministic extraction<br/>order ids, tracking numbers, amounts"]
     B --> C["LLM call<br/>JSON response schema"]
     C --> D{Valid?}
     D -- no --> R["Retry once with<br/>the validation error"] --> D
@@ -60,15 +89,19 @@ The short version is below; the reasoning is in [docs/decisions.md](docs/decisio
 | A fake LLM client for tests | The test suite runs in CI on every push, for free, and is deterministic. |
 | Prompt untrusted, delimiters sanitised | An email cannot close the `<email>` block and add instructions outside it. |
 | Postgres + JSONB, migrations with Alembic | One database for orders, emails and run logs; CI checks that migrations match the models. |
+| The job queue is a Postgres table | No broker to run. The email and its job are saved in one transaction. |
+| Retry provider errors only, with backoff | A quota or network error often passes; an invalid answer usually comes back the same. |
 
 ## Roadmap
 
 - [x] **Step 1: triage pipeline.** Extraction, structured LLM call, validation and retry,
   guards, run log with cost, REST API, tests, CI with Postgres.
-- [ ] **Step 2: agent and human approval.** Event-triggered queue and worker, an agent that
-  calls tools (order lookup, carrier tracking, similar past cases with pgvector) exposed
-  through an MCP server, and actions (refund, reply) that the agent can only *propose*:
-  a person approves them before they run.
+- [ ] **Step 2: agent and human approval.**
+  - [x] **2a.** Job queue in Postgres and background worker, with retries and recovery of
+    abandoned jobs.
+  - [ ] **2b.** An agent that calls read-only tools (order lookup, carrier tracking), and
+    actions (refund, reply) that it can only *propose*: a person approves them before they run.
+  - [ ] **2c.** The tools exposed through an MCP server, and similar past cases with pgvector.
 - [ ] **Step 3: evaluations.** Golden dataset, deterministic checks first, LLM-as-judge with a
   written rubric for free text, pass rate over repeated runs, prompt-injection cases, and a
   CI gate that fails on regression. Tracing with Langfuse.
@@ -81,7 +114,7 @@ Requirements: Docker, and a free Gemini API key from [Google AI Studio](https://
 
 ```bash
 cp .env.example .env          # then put your GEMINI_API_KEY in .env
-docker compose up --build     # Postgres + API on http://localhost:8000
+docker compose up --build     # Postgres, migrations, API on http://localhost:8000, worker
 ```
 
 Then open http://localhost:8000/docs, or send an email:
@@ -94,6 +127,14 @@ curl -X POST localhost:8000/emails -H "Content-Type: application/json" -d '{
 }'
 ```
 
+The answer has status `received` and a queued job. A second later, the worker has triaged it:
+
+```bash
+curl localhost:8000/emails/<id>   # id from the answer above: status, triage, runs, jobs
+```
+
+More workers: `docker compose up --scale worker=3`.
+
 ### Local development
 
 ```bash
@@ -103,7 +144,8 @@ pip install -e ".[dev]"
 docker compose up -d db       # from the repo root, or use your own Postgres
 alembic upgrade head
 python -m scripts.seed
-uvicorn app.main:app --reload
+uvicorn app.main:app --reload # terminal 1: the API
+python -m app.worker          # terminal 2: the worker (needs GEMINI_API_KEY)
 ```
 
 Checks (the same as CI):
@@ -122,9 +164,9 @@ python -m scripts.try_samples
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/emails` | Store an email and triage it. Returns the result and the run log. |
+| `POST` | `/emails` | Store an email and queue it for triage. Returns `202` with status `received`. |
 | `GET` | `/emails?status=needs_review` | List emails, optionally filtered by status. |
-| `GET` | `/emails/{id}` | One email with all its runs. |
+| `GET` | `/emails/{id}` | One email with its runs (model calls) and jobs (queue history). |
 | `GET` | `/health` | Liveness check. |
 
 ## Project layout
@@ -132,14 +174,16 @@ python -m scripts.try_samples
 ```
 backend/
   app/
-    api/         FastAPI routes and dependencies
+    api/         FastAPI routes
     llm/         LLMClient interface, Gemini client, fake client for tests
     triage/      extraction, prompt, classifier and guards, pipeline
-    models.py    SQLAlchemy tables: orders, emails, triage_runs
+    jobs.py      the Postgres job queue: enqueue, claim, retry, recover abandoned jobs
+    worker.py    background worker (python -m app.worker)
+    models.py    SQLAlchemy tables: orders, emails, triage_runs, jobs
     schemas.py   Pydantic models, including the LLM response schema
   alembic/       database migrations
   scripts/       seed data, sample run
-  tests/         unit, API and Postgres integration tests
+  tests/         unit, API, worker, and Postgres tests (migrations, queue locking)
 data/
   seed/          fictional orders
   samples/       24 fictional emails with expected labels

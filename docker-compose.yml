@@ -16,21 +16,40 @@ services:
       timeout: 3s
       retries: 10
 
+  # Runs once: applies the migrations and loads the demo orders, then exits.
+  # The api and the worker start only after it has succeeded.
+  migrate:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql+psycopg://claimdesk:claimdesk@db:5432/claimdesk
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./data:/data:ro
+    command: ["sh", "-c", "alembic upgrade head && python -m scripts.seed"]
+
   api:
     build: ./backend
     env_file: .env
     environment:
       DATABASE_URL: postgresql+psycopg://claimdesk:claimdesk@db:5432/claimdesk
     depends_on:
-      db:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     ports:
       - "8000:8000"
-    volumes:
-      - ./data:/data:ro
-    command: >
-      sh -c "alembic upgrade head && python -m scripts.seed &&
-             uvicorn app.main:app --host 0.0.0.0 --port 8000"
+
+  # Takes triage jobs from the queue. Run several with: docker compose up --scale worker=3
+  worker:
+    build: ./backend
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://claimdesk:claimdesk@db:5432/claimdesk
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    command: ["python", "-m", "app.worker"]
 
 volumes:
   pgdata:

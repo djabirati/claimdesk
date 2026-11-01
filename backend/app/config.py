@@ -24,6 +24,16 @@ class Settings(BaseSettings):
     # Number of LLM calls allowed for one email when the output fails validation.
     triage_max_attempts: int = 2
 
+    # Queue and worker.
+    # How many times a job may run before it is marked failed (provider errors are retried).
+    job_max_attempts: int = 4
+    # Delay before the first retry, multiplied by 4 at each new failure (15 s, 1 min, 4 min).
+    job_retry_base_seconds: float = 15
+    # A job still "running" after this long is considered abandoned (worker crashed or killed).
+    job_lock_timeout_seconds: float = 300
+    # How long an idle worker waits before looking at the queue again.
+    worker_poll_seconds: float = 1.0
+
 
 @lru_cache
 def get_settings() -> Settings:

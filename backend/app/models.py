@@ -2,12 +2,12 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, ForeignKey, Numeric, String, Text, func
+from sqlalchemy import JSON, DateTime, ForeignKey, Index, Numeric, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
-from app.enums import EmailStatus
+from app.enums import EmailStatus, JobStatus
 
 # JSONB on Postgres (indexable, compact), plain JSON elsewhere (SQLite in unit tests).
 JSONType = JSON().with_variant(JSONB(), "postgresql")
@@ -48,6 +48,9 @@ class Email(Base):
     runs: Mapped[list["TriageRun"]] = relationship(
         back_populates="email", order_by="TriageRun.id", cascade="all, delete-orphan"
     )
+    jobs: Mapped[list["Job"]] = relationship(
+        back_populates="email", order_by="Job.id", cascade="all, delete-orphan"
+    )
 
 
 class TriageRun(Base):
@@ -71,3 +74,30 @@ class TriageRun(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     email: Mapped[Email] = relationship(back_populates="runs")
+
+
+class Job(Base):
+    """One piece of background work on one email, waiting in the queue or done.
+
+    The queue is this table: no separate broker to run. See app/queue/jobs.py.
+    """
+
+    __tablename__ = "jobs"
+    # The worker's query filters on status and sorts on run_after.
+    __table_args__ = (Index("ix_jobs_status_run_after", "status", "run_after"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    kind: Mapped[str] = mapped_column(String(40))
+    email_id: Mapped[int] = mapped_column(ForeignKey("emails.id", ondelete="CASCADE"), index=True)
+    status: Mapped[str] = mapped_column(String(20), default=JobStatus.QUEUED)
+    attempts: Mapped[int] = mapped_column(default=0)
+    max_attempts: Mapped[int]
+    # The job is not picked before this time (used to space out retries).
+    run_after: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    locked_by: Mapped[str | None] = mapped_column(String(120))
+    locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    email: Mapped[Email] = relationship(back_populates="jobs")
