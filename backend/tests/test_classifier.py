@@ -50,6 +50,13 @@ def test_provider_failure_is_recorded_as_error_without_retry() -> None:
     assert len(llm.calls) == 1
 
 
+def test_rejected_request_is_recorded_as_rejected() -> None:
+    outcome, llm = run([LLMError("404 model not found", retryable=False)])
+    assert outcome.status is RunStatus.REJECTED
+    assert outcome.error == "404 model not found"
+    assert len(llm.calls) == 1
+
+
 def test_invented_order_id_is_dropped_and_flagged() -> None:
     # The email contains ML-104201; the model answers with an id that is not in the text.
     outcome, _ = run([triage_json(order_id="ML-999999")])
