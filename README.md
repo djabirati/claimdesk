@@ -33,8 +33,8 @@ flowchart LR
     W2[Worker] -->|claim| Q
     W1 --> T[Triage]
     T -->|success| D[job done]
-    T -->|"provider error"| R["retry later<br/>15 s, 1 min, 4 min"]
-    T -->|"invalid output twice"| F[job failed]
+    T -->|"temporary provider error"| R["retry later<br/>15 s, 1 min, 4 min"]
+    T -->|"rejected request,<br/>invalid output twice"| F[job failed]
 ```
 
 1. **The API does not call the model.** `POST /emails` stores the email and a `triage` job
@@ -42,9 +42,11 @@ flowchart LR
    model call never blocks the caller, and an email is never stored without its job.
 2. **Workers claim jobs with `SELECT ... FOR UPDATE SKIP LOCKED`.** Several workers can run
    at once: each job goes to one of them, and none waits on a row another is claiming.
-   The claim is committed right away, so no transaction stays open during the model call.
-3. **Only provider errors are retried**, with a growing delay. An invalid answer was already
-   retried once with the validation error, so the email is marked failed instead.
+   The claim is committed right away, and the triage ends its read transaction before the
+   model call, so no transaction stays open while waiting for the model.
+3. **Only temporary provider errors are retried** (network, timeout, quota, server error),
+   with a growing delay. Each model call has a timeout (90 s), kept below the lock timeout. A rejected request (invalid key, unknown model) fails at once, and so does
+   an answer that was invalid twice: retrying would give the same result.
 4. **Abandoned jobs come back.** A job still `running` after the lock timeout (worker crashed
    or killed) goes back to the queue; its attempt counts, so it cannot loop forever. A job can
    therefore run twice, and the worker skips an email that is already triaged.
@@ -90,7 +92,8 @@ The short version is below; the reasoning is in [docs/decisions.md](docs/decisio
 | Prompt untrusted, delimiters sanitised | An email cannot close the `<email>` block and add instructions outside it. |
 | Postgres + JSONB, migrations with Alembic | One database for orders, emails and run logs; CI checks that migrations match the models. |
 | The job queue is a Postgres table | No broker to run. The email and its job are saved in one transaction. |
-| Retry provider errors only, with backoff | A quota or network error often passes; an invalid answer usually comes back the same. |
+| Retry temporary provider errors only, with backoff | A quota or network error often passes; an unknown model or an invalid answer comes back the same. |
+| No temperature on Gemini 3 | Google advises against it. Answers may vary, which the evaluation suite measures. |
 
 ## Roadmap
 

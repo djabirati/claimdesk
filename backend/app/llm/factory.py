@@ -8,5 +8,10 @@ def build_llm_client(settings: Settings) -> LLMClient:
             raise LLMNotConfiguredError("GEMINI_API_KEY is not set")
         from app.llm.gemini import GeminiClient
 
-        return GeminiClient(api_key=settings.gemini_api_key, model=settings.llm_model)
+        return GeminiClient(
+            api_key=settings.gemini_api_key,
+            model=settings.llm_model,
+            thinking_level=settings.llm_thinking_level,
+            timeout_seconds=settings.llm_timeout_seconds,
+        )
     raise LLMNotConfiguredError(f"Unknown LLM provider: {settings.llm_provider}")

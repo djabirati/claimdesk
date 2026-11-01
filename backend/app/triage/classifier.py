@@ -105,7 +105,7 @@ def classify(
                 system=SYSTEM_PROMPT, prompt=next_prompt, schema=TriageOutput
             )
         except LLMError as exc:
-            outcome.status = RunStatus.ERROR
+            outcome.status = RunStatus.ERROR if exc.retryable else RunStatus.REJECTED
             outcome.error = str(exc)
             break
 

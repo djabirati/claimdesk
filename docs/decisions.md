@@ -89,8 +89,10 @@ run side by side.
 in one transaction and answers `202`. A worker claims the oldest due job with
 `SELECT ... FOR UPDATE SKIP LOCKED`: the row lock stops two workers from taking the same job,
 and `SKIP LOCKED` makes a worker move on to the next job instead of waiting. The claim is
-committed at once (status `running`), so no transaction stays open during the model call.
-A job left `running` longer than the lock timeout is put back in the queue.
+committed at once (status `running`), and the triage ends the transaction opened by reading
+the email before it calls the model, so no transaction stays open while waiting (a Postgres
+test checks that no connection is `idle in transaction` during the call). A job left
+`running` longer than the lock timeout is put back in the queue.
 
 **Cost.** Workers poll the table (every second when idle) instead of being notified;
 Postgres `LISTEN/NOTIFY` could remove that delay. A dedicated broker (Redis, RabbitMQ) would
@@ -98,18 +100,46 @@ handle far more jobs per second, which this project does not need. Because an ab
 comes back, a job can run more than once (at-least-once processing): the worker skips an
 email that is already triaged, so a repeat does not pay for a second model call.
 
-## 8. Retry provider errors with a growing delay, not invalid answers
+## 8. Retry temporary provider errors with a growing delay, nothing else
 
-**Context.** Two kinds of failure reach the worker. The provider does not answer (network,
-quota, server error), or it answers with output that fails validation twice.
+**Context.** Three kinds of failure reach the worker. The provider does not answer for a
+while (network, quota, server error); it refuses the request itself (invalid key, unknown
+model, malformed request); or it answers with output that fails validation twice.
 
-**Decision.** Provider errors are retried up to `job_max_attempts` times (4 by default),
-waiting 15 s, then 1 min, then 4 min. An invalid answer was already retried once inside the
-triage with the exact validation error; the same email at temperature 0 would most likely
-fail again, so the job and the email are marked failed at once. An unexpected exception in
-the worker is treated like a provider error, so a bug cannot kill the worker or block the
-queue. Every attempt is logged as a run.
+**Decision.** The Gemini client sorts provider errors by HTTP code: 408, 429 and 5xx are
+temporary, other 4xx are not. Temporary errors are retried up to `job_max_attempts` times
+(4 by default), waiting 15 s, then 1 min, then 4 min. A rejected request is stored as a
+`rejected` run and fails the job at once: every retry would get the same answer. An invalid
+answer was already retried once inside the triage with the exact validation error; the same
+email would most likely fail again, so the job and the email are marked failed at once. An
+unexpected exception in the worker is treated like a temporary error, so a bug cannot kill
+the worker or block the queue. Every attempt is logged as a run.
+
+Each model call has a timeout (`llm_timeout_seconds`, 90 s): the SDK sets none, and a call
+that never returns would block the worker for good. A timeout counts as a temporary error.
+The timeout times the number of calls in one triage must stay below the lock timeout, or a
+job still waiting for the model would be handed to a second worker; the settings refuse
+values that break this.
+
+The split came from the first run with a real key: Google had closed `gemini-2.5-flash` to
+new users and answered 404, and the worker kept retrying a call that could never work.
+The same run took 39 s for one email on the free tier, which showed the missing timeout and a
+transaction left open during the call.
 
 **Cost.** A failed email waits for a person; there is no endpoint yet to queue it again.
 The delays have no random jitter, so many jobs failing together retry together, which only
-matters with many workers.
+matters with many workers. The HTTP codes are Gemini's; another provider needs its own mapping.
+
+## 9. Follow the provider's sampling advice: no temperature on Gemini 3
+
+**Context.** Step 1 set `temperature=0` to reduce variation between runs. Google asks not to
+set sampling parameters on Gemini 3 models, and warns that a low temperature can degrade
+answers (looping, weaker reasoning).
+
+**Decision.** The client sends no temperature. It sets the thinking level to `low`, since
+sorting an email does not need long reasoning and thinking tokens are billed as output. The
+level is a setting (`LLM_THINKING_LEVEL`), left empty for a Gemini 2.5 model.
+
+**Cost.** Answers can vary from one run to the next for the same email. The design already
+assumes this: the code checks every answer, and the evaluation suite (step 3) measures the
+pass rate over repeated runs instead of trusting a single one.
