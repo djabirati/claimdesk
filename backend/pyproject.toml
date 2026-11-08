@@ -11,9 +11,10 @@ dependencies = [
     "psycopg[binary]>=3.2",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
-    "google-genai>=1.0",
+    # Major versions are bounded: 3.0 changed the HTTP library under our error handling.
+    "google-genai>=2.34,<4",
     "httpx>=0.27",
-    "pgvector>=0.5",
+    "pgvector>=0.5,<1",
     "mcp>=2.3,<3",
 ]
 

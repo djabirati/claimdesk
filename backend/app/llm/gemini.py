@@ -25,6 +25,18 @@ T = TypeVar("T")
 # email, since emails are compared with each other.
 EMBEDDING_TASK_PREFIX = "task: sentence similarity | query: "
 
+# The SDK sends its requests with httpx (google-genai 2) or httpx2 (google-genai 3, a
+# drop-in fork of httpx). A timeout or a network failure can come from either.
+_HTTP_LIBRARIES: list[Any] = [httpx]
+try:
+    import httpx2
+
+    _HTTP_LIBRARIES.append(httpx2)
+except ImportError:  # google-genai 2 without httpx2 installed
+    pass
+TIMEOUT_ERRORS = tuple(lib.TimeoutException for lib in _HTTP_LIBRARIES)
+NETWORK_ERRORS = tuple(lib.HTTPError for lib in _HTTP_LIBRARIES)
+
 # HTTP codes worth retrying: timeout, quota or rate limit, and server-side errors.
 # Other 4xx codes (invalid key, unknown model, malformed request) fail the same way every time.
 RETRYABLE_STATUS = {408, 429}
@@ -160,11 +172,11 @@ class GeminiClient:
             return request()
         except errors.APIError as exc:  # quota, invalid key, unknown model, server error...
             raise LLMError(f"Gemini API error: {exc}", retryable=is_retryable(exc.code)) from exc
-        except httpx.TimeoutException as exc:
+        except TIMEOUT_ERRORS as exc:
             raise LLMError(
                 f"Gemini did not answer within {self.timeout_seconds:g} s", retryable=True
             ) from exc
-        except httpx.HTTPError as exc:  # network failure, proxy refusal
+        except NETWORK_ERRORS as exc:  # network failure, proxy refusal
             raise LLMError(f"Network error calling Gemini: {exc}", retryable=True) from exc
 
     def embed(self, text: str) -> list[float]:
