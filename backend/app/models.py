@@ -2,12 +2,14 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import JSON, DateTime, ForeignKey, Index, Numeric, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
 from app.enums import ActionStatus, EmailStatus, JobStatus
+from app.llm.base import EMBEDDING_DIMENSIONS
 
 # JSONB on Postgres (indexable, compact), plain JSON elsewhere (SQLite in unit tests).
 JSONType = JSON().with_variant(JSONB(), "postgresql")
@@ -56,6 +58,9 @@ class Email(Base):
     )
     actions: Mapped[list["ProposedAction"]] = relationship(
         back_populates="email", order_by="ProposedAction.id", cascade="all, delete-orphan"
+    )
+    embedding: Mapped["EmailEmbedding | None"] = relationship(
+        back_populates="email", cascade="all, delete-orphan"
     )
 
 
@@ -163,3 +168,28 @@ class ProposedAction(Base):
 
     email: Mapped[Email] = relationship(back_populates="actions")
     agent_run: Mapped[AgentRun] = relationship(back_populates="actions")
+
+
+class EmailEmbedding(Base):
+    """The vector of an email, used to find similar past cases (see app/similar.py)."""
+
+    __tablename__ = "email_embeddings"
+    __table_args__ = (
+        # HNSW: approximate nearest neighbours, fast even with many rows. Cosine distance,
+        # the measure the embedding model is meant for.
+        Index(
+            "ix_email_embeddings_embedding",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+    )
+
+    email_id: Mapped[int] = mapped_column(
+        ForeignKey("emails.id", ondelete="CASCADE"), primary_key=True
+    )
+    model: Mapped[str] = mapped_column(String(80))
+    embedding: Mapped[list[float]] = mapped_column(Vector(EMBEDDING_DIMENSIONS))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    email: Mapped[Email] = relationship(back_populates="embedding")

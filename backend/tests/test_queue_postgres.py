@@ -20,7 +20,7 @@ from app.config import Settings
 from app.enums import ActionKind, EmailStatus, JobKind, JobStatus
 from app.jobs import claim_next_job, enqueue, utcnow
 from app.llm.base import Message, ModelTurn
-from app.llm.fake import FakeLLMClient, model_turn
+from app.llm.fake import FakeLLMClient, bag_of_words_embedding, model_turn
 from app.models import AgentRun, Email, Job, ProposedAction
 from app.worker import run_once
 from tests.conftest import triage_json
@@ -158,18 +158,27 @@ def test_no_transaction_stays_open_during_the_agent_calls(
         model_turn(text="Aucune commande trouvée."),
     ]
 
-    def turn(messages: list[Message]) -> ModelTurn:
+    def look() -> None:
         with probe.connect() as conn:
             idle_in_transaction.append(conn.execute(IDLE_IN_TRANSACTION).scalar_one())
+
+    def turn(messages: list[Message]) -> ModelTurn:
+        look()
         return script.pop(0)
+
+    def embed(text: str) -> list[float]:
+        look()
+        return bag_of_words_embedding(text)
 
     with factory() as session:
         email = session.get_one(Email, email_id)
         settings = Settings(_env_file=None)  # type: ignore[call-arg]
-        run_agent(session, email, FakeLLMClient(script=[], turns=turn), settings)
+        llm = FakeLLMClient(script=[], turns=turn, embedder=embed)
+        run_agent(session, email, llm, settings)
     probe.dispose()
 
-    assert idle_in_transaction == [0, 0]  # before each model call, after the tool's read
+    # During the embedding call, then before each model call (after the tool's read).
+    assert idle_in_transaction == [0, 0, 0]
 
 
 def test_two_people_approving_at_once_execute_the_refund_once(

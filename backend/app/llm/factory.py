@@ -13,5 +13,6 @@ def build_llm_client(settings: Settings) -> LLMClient:
             model=settings.llm_model,
             thinking_level=settings.llm_thinking_level,
             timeout_seconds=settings.llm_timeout_seconds,
+            embedding_model=settings.embedding_model,
         )
     raise LLMNotConfiguredError(f"Unknown LLM provider: {settings.llm_provider}")

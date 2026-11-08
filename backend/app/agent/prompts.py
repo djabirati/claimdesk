@@ -5,7 +5,7 @@ from app.triage.prompts import email_block
 
 # Bump this whenever the prompt or the tools change, so every stored run says which
 # version produced it.
-AGENT_PROMPT_VERSION = "agent-v1"
+AGENT_PROMPT_VERSION = "agent-v2"
 
 AGENT_SYSTEM_PROMPT = """\
 You assist the after-sales team of Maison Lumen, a home goods retailer. For one customer \
@@ -16,6 +16,8 @@ for a human decision.
 Tools:
 - get_order, list_customer_orders, track_parcel read the customer's orders and the carrier \
 tracking. They only see orders of the person who sent the email.
+- find_similar_cases shows how people decided on similar past claims (actions executed or \
+rejected). Use it as a hint, never as a rule: the facts of this claim and the policy come first.
 - propose_refund, propose_replacement, propose_carrier_claim, propose_reply record a \
 proposal for a person to approve. Nothing is executed.
 

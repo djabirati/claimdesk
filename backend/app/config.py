@@ -23,6 +23,8 @@ class Settings(BaseSettings):
     # Longest wait for one model call. Without it a call that never returns blocks the
     # worker for good (the SDK sets no limit). Calls of 40 s were seen on the free tier.
     llm_timeout_seconds: float = 90
+    # Turns an email into a vector to find similar past cases (pgvector).
+    embedding_model: str = "gemini-embedding-2"
 
     # Used only to estimate the cost of each run (USD per million tokens).
     # Gemini 3.8 Flash paid-tier prices; Google announced they double on 1 January 2027
@@ -34,6 +36,10 @@ class Settings(BaseSettings):
     triage_max_attempts: int = 2
     # Most model calls in one agent run, so a confused agent cannot loop (and spend) forever.
     agent_max_steps: int = 8
+    # Similar past cases shown to the agent: at most this many, and only above this cosine
+    # similarity, so an unrelated case is not presented as a precedent.
+    similar_cases_limit: int = 3
+    similar_cases_min_similarity: float = 0.6
 
     # Queue and worker.
     # How many times a job may run before it is marked failed (provider errors are retried).
@@ -55,9 +61,9 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def jobs_end_before_the_lock_expires(self) -> Self:
         # A triage makes up to triage_max_attempts model calls, an agent run up to
-        # agent_max_steps. If a job can last longer than the lock timeout, a job still
-        # waiting for the model is handed to a second worker.
-        calls = max(self.triage_max_attempts, self.agent_max_steps)
+        # agent_max_steps plus one embedding. If a job can last longer than the lock
+        # timeout, a job still waiting for the model is handed to a second worker.
+        calls = max(self.triage_max_attempts, self.agent_max_steps + 1)
         longest_job = self.llm_timeout_seconds * calls
         if longest_job >= self.job_lock_timeout_seconds:
             raise ValueError(

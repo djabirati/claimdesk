@@ -1,10 +1,21 @@
+import hashlib
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 from pydantic import BaseModel
 
-from app.llm.base import LLMError, LLMResponse, Message, ModelTurn, ToolCall, ToolSpec
+from app.llm.base import (
+    EMBEDDING_DIMENSIONS,
+    LLMError,
+    LLMResponse,
+    Message,
+    ModelTurn,
+    ToolCall,
+    ToolSpec,
+    normalize,
+)
 
 Script = list[str | Exception] | Callable[[str], str]
 TurnScript = list[ModelTurn | Exception] | Callable[[list[Message]], ModelTurn] | None
@@ -21,6 +32,20 @@ def model_turn(*calls: tuple[str, dict[str, Any]], text: str = "") -> ModelTurn:
     )
 
 
+_WORD = re.compile(r"\w{3,}")
+
+
+def bag_of_words_embedding(text: str) -> list[float]:
+    """A crude but deterministic embedding: texts sharing words get close vectors."""
+    vector = [0.0] * EMBEDDING_DIMENSIONS
+    for word in _WORD.findall(text.lower()):
+        index = int(hashlib.md5(word.encode()).hexdigest(), 16) % EMBEDDING_DIMENSIONS
+        vector[index] += 1.0
+    if not any(vector):
+        vector[0] = 1.0
+    return normalize(vector)
+
+
 @dataclass
 class FakeLLMClient:
     """Scripted stand-in for a real model, used in tests so they never call a paid API.
@@ -29,13 +54,18 @@ class FakeLLMClient:
     the list is raised instead, to simulate a provider failure), or a function of the
     prompt. `turns` drives generate_with_tools the same way (a function receives the
     conversation so far). With no `turns`, the agent ends at once without proposing
-    anything. Every call is recorded so tests can check what was sent.
+    anything. `embedder` makes the embeddings (words in common, close vectors). Every call
+    is recorded so tests can check what was sent.
     """
 
     script: Script
     turns: TurnScript = None
+    # Embedding of a text; an Exception here is raised instead, to simulate a failure.
+    embedder: Callable[[str], list[float]] | Exception = bag_of_words_embedding
     model: str = "fake-model"
+    embedding_model: str = "fake-embedding"
     calls: list[dict[str, Any]] = field(default_factory=list)
+    embedded: list[str] = field(default_factory=list)
 
     def generate_json(self, *, system: str, prompt: str, schema: type[BaseModel]) -> LLMResponse:
         self.calls.append({"system": system, "prompt": prompt, "schema": schema.__name__})
@@ -81,3 +111,9 @@ class FakeLLMClient:
             output_tokens=(len(turn.text) + len(repr(turn.tool_calls))) // 4,
             model=self.model,
         )
+
+    def embed(self, text: str) -> list[float]:
+        self.embedded.append(text)
+        if isinstance(self.embedder, Exception):
+            raise self.embedder
+        return self.embedder(text)

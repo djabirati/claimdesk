@@ -83,6 +83,17 @@ class LLMNotConfiguredError(Exception):
     """No provider credentials were given."""
 
 
+# Fixed by the database column (migration 0004): changing it means a new migration and
+# embedding every email again.
+EMBEDDING_DIMENSIONS = 768
+
+
+def normalize(vector: list[float]) -> list[float]:
+    """Scale to length 1. A vector cut to fewer dimensions is no longer unit-length."""
+    norm = sum(x * x for x in vector) ** 0.5
+    return [x / norm for x in vector] if norm else vector
+
+
 class LLMClient(Protocol):
     """What the rest of the code needs from a model provider.
 
@@ -91,6 +102,7 @@ class LLMClient(Protocol):
     """
 
     model: str
+    embedding_model: str
 
     def generate_json(self, *, system: str, prompt: str, schema: type[BaseModel]) -> LLMResponse:
         """Ask for a JSON answer that should follow `schema`. Validation is the caller's job."""
@@ -103,5 +115,12 @@ class LLMClient(Protocol):
 
         The client never runs a tool itself: it returns the calls, and the caller decides
         what to do with them.
+        """
+        ...
+
+    def embed(self, text: str) -> list[float]:
+        """A unit-length vector of EMBEDDING_DIMENSIONS numbers, for similarity search.
+
+        Texts compared with each other must be embedded by the same model.
         """
         ...
