@@ -197,3 +197,45 @@ call would carry the action id as an idempotency key, so a crash between "approv
 "executed" could be retried without paying twice; an action stuck in `approved` is visible
 but nothing retries it yet. There is no authentication: the reviewer's name is given, not
 proven.
+
+## 13. Similar past cases: people's decisions, never other customers' text
+
+**Context.** Reviewers' decisions are the best source on what the team accepts: which
+refunds were refused, when a replacement was preferred. The agent should see how similar
+claims were decided. But a past case belongs to another customer, and its text was written
+by someone outside the company.
+
+**Decision.** The agent embeds each email once (Gemini Embedding 2, 768 dimensions, the
+same "sentence similarity" prefix on every email) and stores the vector in Postgres with
+pgvector, behind an HNSW index with cosine distance. `find_similar_cases` returns at most
+3 past emails that a person decided on (an action executed or rejected), above a cosine
+similarity of 0.6 and embedded by the same model. Each case shows only the category, the
+request, and the decisions (action, outcome, amount). No email text, no name or address, no
+note written by the agent or a reviewer. A failed embedding never stops the agent: it works
+without similar cases, with a `no_embedding` flag.
+
+**Cost.** The agent learns what was decided, not why: a reviewer's note ("no photo sent")
+would help, but it is free text that could carry personal data. A closed list of rejection
+reasons would give the why safely. The filters run after the approximate HNSW search, so
+with many undecided emails a query can return fewer cases than it could; pgvector's
+iterative index scans (0.8 and later) address this. The threshold of 0.6 is a first guess,
+to tune with evaluation data.
+
+## 14. A read-only MCP server that reuses the agent's tools
+
+**Context.** The team's own assistants (Claude Desktop, an IDE) could answer questions about
+the inbox and the queue, if they could reach the data. MCP is the standard way to offer
+tools to them.
+
+**Decision.** `app/mcp_server.py` (MCP Python SDK 2, stdio) exposes the inbox, one email with
+the agent's note and proposals, the approval queue, and the agent's read tools. These run
+through the same `call_tool` function as in the agent, with a context built for the email
+named in the call: the same validation, and the same scoping to that email's sender. The
+list of agent tools offered is built from the tools marked `read`, so a new read tool is
+offered automatically and a propose tool never is. Nothing proposes, approves or executes:
+an MCP client is a model, and approving stays a human act in the app. Tools are marked
+read-only for the client.
+
+**Cost.** No authentication on stdio: whoever can start the process can read the database
+it points to, so this is for a person's own machine. Serving it over HTTP to a team would
+need authentication (the SDK supports OAuth) and a database user with read-only rights.

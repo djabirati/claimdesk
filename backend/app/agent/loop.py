@@ -23,6 +23,7 @@ from app.jobs import utcnow
 from app.llm.base import LLMClient, LLMError, Message, ToolResult, ToolResults, UserMessage
 from app.llm.cost import estimate_cost
 from app.models import AgentRun, Email, ProposedAction
+from app.similar import ensure_embedding
 
 
 def run_agent(
@@ -35,7 +36,13 @@ def run_agent(
 ) -> AgentRun:
     """Run the agent on a triaged email, then save the run and its proposals. Commits."""
     now = now or utcnow()
-    ctx = ToolContext(session=session, email=email, now=now)
+    ctx = ToolContext(
+        session=session,
+        email=email,
+        now=now,
+        similar_cases_limit=settings.similar_cases_limit,
+        similar_cases_min_similarity=settings.similar_cases_min_similarity,
+    )
     messages: list[Message] = [
         UserMessage(
             build_agent_prompt(
@@ -49,11 +56,20 @@ def run_agent(
         )
     ]
     trace: list[dict[str, Any]] = []
+    flags: list[str] = []
     status = AgentRunStatus.STEP_LIMIT
     note: str | None = None
     error: str | None = None
     steps = input_tokens = output_tokens = 0
     start = time.perf_counter()
+
+    # The vector of this email: needed to find similar past cases, and to let future
+    # claims find this one. A failure here never stops the agent: it works without
+    # similar cases, and the flag tells the reviewer.
+    try:
+        ensure_embedding(session, email, llm)
+    except LLMError:
+        flags.append("no_embedding")
 
     for step in range(1, settings.agent_max_steps + 1):
         # No transaction stays open while waiting for the model (see decision 7).
@@ -91,7 +107,6 @@ def run_agent(
             results.append(ToolResult(call=call, content=result))
         messages.append(ToolResults(results))
 
-    flags = []
     if status is AgentRunStatus.STEP_LIMIT:
         flags.append("step_limit")
     if status in (AgentRunStatus.COMPLETED, AgentRunStatus.STEP_LIMIT):

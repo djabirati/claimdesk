@@ -5,13 +5,14 @@
 An LLM-powered triage service for delivery-dispute emails, built for an after-sales team.
 Every incoming email is classified, its identifiers are extracted and checked against the
 text, and anything uncertain goes to a person. For each claim, an agent checks the order and
-the carrier tracking, then proposes the actions (refund, replacement, carrier claim, reply):
-a person approves each one before it runs. Every model call and tool call is logged with its
-cost.
+the carrier tracking, looks at how people decided on similar past claims (pgvector), then
+proposes the actions (refund, replacement, carrier claim, reply): a person approves each one
+before it runs. Every model call and tool call is logged with its cost. A read-only MCP
+server gives the same data and tools to any MCP client, such as Claude Desktop.
 
-> **Status: step 2b of 5.** Triage pipeline, job queue and worker, and the agent with human
-> approval are done. MCP server, evals and the dashboard are next (see [Roadmap](#roadmap)).
-> The agent's quality has not been measured yet: that is step 3.
+> **Status: step 2 of 5.** Triage pipeline, job queue and worker, agent with human approval,
+> similar past cases and MCP server are done. Evals and the dashboard are next (see
+> [Roadmap](#roadmap)). The agent's quality has not been measured yet: that is step 3.
 
 ## Why this project
 
@@ -90,9 +91,10 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    J[Agent job] --> M["Model call<br/>with 7 tools"]
+    J[Agent job] --> E["Embed the email<br/>(once, pgvector)"]
+    E --> M["Model call<br/>with 8 tools"]
     M -->|tool calls| T{"Tool"}
-    T -->|read| R["get_order, list_customer_orders,<br/>track_parcel (sender's orders only)"]
+    T -->|read| R["get_order, list_customer_orders,<br/>track_parcel (sender's orders only),<br/>find_similar_cases (decisions only)"]
     T -->|propose| P["propose_refund, _replacement,<br/>_carrier_claim, _reply<br/>(validated, kept in memory)"]
     R --> M
     P --> M
@@ -105,8 +107,8 @@ flowchart LR
 1. **A loop written by hand.** One step is one model call with the tool declarations. The
    loop runs the tool calls the model asks for, sends the results back, and stops when the
    model answers with text only (its note for the reviewer) or after 8 steps.
-2. **Two kinds of tools, none that acts.** Read tools look up orders and the (simulated)
-   carrier tracking. Propose tools record a proposal. Executing an approved action is done by
+2. **Two kinds of tools, none that acts.** Read tools look up orders, the (simulated)
+   carrier tracking, and similar past cases. Propose tools record a proposal. Executing an approved action is done by
    `app/actions.py`, which the agent never imports; a test checks it.
 3. **Least privilege.** Every tool only sees the orders of the email's sender. An injected
    "refund order ML-104206" from another address gets "not found".
@@ -121,8 +123,64 @@ flowchart LR
    is paid, shipped or sent) and `reject` closes it. Approval is a compare-and-set
    (`UPDATE ... WHERE status = 'proposed'`): two people clicking at once execute it once.
 7. **Trace.** Each agent run stores its steps, tokens, cost, flags (`step_limit`,
-   `no_reply_proposed`, `tool_errors`) and one trace entry per tool call: arguments, result,
-   duration.
+   `no_reply_proposed`, `tool_errors`, `no_embedding`) and one trace entry per tool call:
+   arguments, result, duration.
+
+### Similar past cases: learning from people's decisions
+
+Before its first step, the agent embeds the email (Gemini Embedding 2, 768 dimensions) and
+stores the vector in Postgres with pgvector, behind an HNSW index. The `find_similar_cases`
+tool returns the closest past emails **that a person already decided on**, with what was
+decided:
+
+```json
+{"similarity": 0.91, "category": "damaged", "requested_action": "replacement",
+ "decisions": [{"action": "replacement", "decision": "executed"},
+               {"action": "refund", "decision": "rejected", "amount_eur": "89.90"}]}
+```
+
+- **Decisions only.** A past case never carries the other email's text, the other
+  customer's name or address, or any free text written by the agent or a reviewer. So it
+  cannot leak another customer's data into this run, nor bring someone else's instructions
+  into the prompt.
+- **Only decided cases, only close ones.** Proposals still waiting are left out, and so are
+  cases below a cosine similarity of 0.6, or embedded by another model.
+- **A hint, not a rule.** The prompt says so: the facts of the claim and the policy come first.
+- **Never blocking.** If the embedding call fails, the agent works without similar cases and
+  the run gets a `no_embedding` flag.
+
+Emails handled before this feature have no vector: `python -m scripts.backfill_embeddings`
+embeds them.
+
+### MCP server: the same data for other assistants
+
+`python -m app.mcp_server` serves ClaimDesk over MCP (stdio). It is **read-only**: list the
+inbox, read one email with the agent's note and proposals, read the approval queue, and run
+the agent's read tools (`get_order`, `list_customer_orders`, `track_parcel`,
+`find_similar_cases`) with the same code and the same limits. Each customer tool takes an
+`email_id` and only sees that sender's orders. No tool proposes, approves or executes: an MCP
+client is a model, and approving stays a human act, in the app. It reads the database only,
+so it needs no model key.
+
+To use it from Claude Desktop, add this to `claude_desktop_config.json` (use the absolute
+path of your clone, with Postgres running from `docker compose up`):
+
+```json
+{
+  "mcpServers": {
+    "claimdesk": {
+      "command": "/path/to/claimdesk/backend/.venv/bin/python",
+      "args": ["-m", "app.mcp_server"],
+      "env": {
+        "DATABASE_URL": "postgresql+psycopg://claimdesk:claimdesk@localhost:5432/claimdesk"
+      }
+    }
+  }
+}
+```
+
+Then ask, for example: "Which actions are waiting for approval, and what did the agent
+check before proposing them?"
 
 ## Design decisions
 
@@ -142,18 +200,22 @@ The short version is below; the reasoning is in [docs/decisions.md](docs/decisio
 | Agent loop written by hand, no framework | One readable file, tested with the fake client; the step limit and the trace are explicit. |
 | The agent proposes, a person approves | The model can be wrong or manipulated; the only path to an action goes through a person. |
 | Tools scoped to the sender's orders | An email cannot make the agent read or act on another customer's order. |
+| Similar cases return decisions, never text | Another customer's data and words never enter the prompt. |
+| pgvector in the same Postgres, HNSW index | No extra vector database to run; the vectors sit next to the decisions they are joined with. |
+| A read-only MCP server reusing the agent's tools | One implementation, one set of limits, and no AI client can approve an action. |
 
 ## Roadmap
 
 - [x] **Step 1: triage pipeline.** Extraction, structured LLM call, validation and retry,
   guards, run log with cost, REST API, tests, CI with Postgres.
-- [ ] **Step 2: agent and human approval.**
+- [x] **Step 2: agent and human approval.**
   - [x] **2a.** Job queue in Postgres and background worker, with retries and recovery of
     abandoned jobs.
   - [x] **2b.** An agent that calls read-only tools (order lookup, carrier tracking), and
     actions (refund, replacement, carrier claim, reply) that it can only *propose*: a person
     approves them before they run.
-  - [ ] **2c.** The tools exposed through an MCP server, and similar past cases with pgvector.
+  - [x] **2c.** Similar past cases with pgvector (decisions only), and a read-only MCP
+    server that reuses the agent's tools.
 - [ ] **Step 3: evaluations.** Golden dataset, deterministic checks first, LLM-as-judge with a
   written rubric for free text, pass rate over repeated runs, prompt-injection cases, and a
   CI gate that fails on regression. Tracing with Langfuse.
@@ -242,15 +304,19 @@ backend/
     triage/      extraction, prompt, classifier and guards, pipeline
     agent/       the agent: loop, tools, prompt
     actions.py   approve, reject, execute (simulated): the human side
+    similar.py   embeddings and similar past cases (pgvector)
+    mcp_server.py  read-only MCP server (python -m app.mcp_server)
     carrier.py   simulated carrier tracking API
     jobs.py      the Postgres job queue: enqueue, claim, retry, recover abandoned jobs
     worker.py    background worker (python -m app.worker): triage and agent jobs
-    models.py    SQLAlchemy tables: orders, emails, triage_runs, jobs, agent_runs, actions
+    models.py    SQLAlchemy tables: orders, emails, triage_runs, jobs, agent_runs, actions,
+                 email_embeddings
     schemas.py   Pydantic models, including the LLM response schema
   alembic/       database migrations
-  scripts/       seed data, sample run, send the samples to the API
-  tests/         unit, API, worker, agent, Gemini client (local stand-in server),
-                 and Postgres tests (migrations, queue locking, concurrent approvals)
+  scripts/       seed data, sample run, send the samples to the API, embed old emails
+  tests/         unit, API, worker, agent, Gemini client (local stand-in server), MCP
+                 (in memory and over stdio), and Postgres tests (migrations, queue locking,
+                 concurrent approvals, pgvector search)
 data/
   seed/          fictional orders
   samples/       24 fictional emails with expected labels
@@ -259,7 +325,8 @@ docs/            design decisions
 
 ## Tech stack
 
-Python 3.12, FastAPI, Pydantic, SQLAlchemy 2, Alembic, PostgreSQL (pgvector image),
-Google Gemini (`google-genai`), pytest, ruff, mypy, Docker, GitHub Actions.
+Python 3.12, FastAPI, Pydantic, SQLAlchemy 2, Alembic, PostgreSQL with pgvector (HNSW),
+Google Gemini (`google-genai`: Gemini 3.8 Flash, Gemini Embedding 2), MCP Python SDK,
+pytest, ruff, mypy, Docker, GitHub Actions.
 
 Built with AI-assisted development (Claude Code).

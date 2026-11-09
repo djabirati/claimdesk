@@ -1,4 +1,5 @@
-from typing import Any
+from collections.abc import Callable
+from typing import Any, TypeVar
 
 import httpx
 from google import genai
@@ -6,6 +7,7 @@ from google.genai import errors, types
 from pydantic import BaseModel
 
 from app.llm.base import (
+    EMBEDDING_DIMENSIONS,
     LLMError,
     LLMResponse,
     Message,
@@ -14,7 +16,14 @@ from app.llm.base import (
     ToolResults,
     ToolSpec,
     UserMessage,
+    normalize,
 )
+
+T = TypeVar("T")
+
+# Gemini Embedding 2 is steered with a text prefix. The same prefix must be used for every
+# email, since emails are compared with each other.
+EMBEDDING_TASK_PREFIX = "task: sentence similarity | query: "
 
 # The SDK sends its requests with httpx (google-genai 2) or httpx2 (google-genai 3, a
 # drop-in fork of httpx). A timeout or a network failure can come from either.
@@ -132,6 +141,7 @@ class GeminiClient:
         model: str,
         thinking_level: str | None = None,
         timeout_seconds: float = 90,
+        embedding_model: str = "gemini-embedding-2",
         base_url: str | None = None,  # tests point the client at a local server
     ) -> None:
         self._client = genai.Client(
@@ -145,14 +155,21 @@ class GeminiClient:
         self.model = model
         self.thinking_level = thinking_level
         self.timeout_seconds = timeout_seconds
+        self.embedding_model = embedding_model
 
     def _generate(
         self, contents: Any, config: types.GenerateContentConfig
     ) -> types.GenerateContentResponse:
-        try:
-            return self._client.models.generate_content(
+        return self._call(
+            lambda: self._client.models.generate_content(
                 model=self.model, contents=contents, config=config
             )
+        )
+
+    def _call(self, request: Callable[[], T]) -> T:
+        """Run one API request and turn its failures into LLMError."""
+        try:
+            return request()
         except errors.APIError as exc:  # quota, invalid key, unknown model, server error...
             raise LLMError(f"Gemini API error: {exc}", retryable=is_retryable(exc.code)) from exc
         except TIMEOUT_ERRORS as exc:
@@ -161,6 +178,21 @@ class GeminiClient:
             ) from exc
         except NETWORK_ERRORS as exc:  # network failure, proxy refusal
             raise LLMError(f"Network error calling Gemini: {exc}", retryable=True) from exc
+
+    def embed(self, text: str) -> list[float]:
+        # Gemini Embedding 2 takes the task as a prefix instead of a task_type setting.
+        # Emails are compared with emails, so both sides use the same "similarity" task.
+        response = self._call(
+            lambda: self._client.models.embed_content(
+                model=self.embedding_model,
+                contents=f"{EMBEDDING_TASK_PREFIX}{text}",
+                config=types.EmbedContentConfig(output_dimensionality=EMBEDDING_DIMENSIONS),
+            )
+        )
+        values = response.embeddings[0].values if response.embeddings else None
+        if not values or len(values) != EMBEDDING_DIMENSIONS:
+            raise LLMError(f"Gemini returned an unexpected embedding ({len(values or [])} values)")
+        return normalize(list(values))
 
     def generate_json(self, *, system: str, prompt: str, schema: type[BaseModel]) -> LLMResponse:
         config = build_config(system=system, schema=schema, thinking_level=self.thinking_level)

@@ -29,6 +29,8 @@ class FakeGemini:
         self.delay_seconds = 0.0
         # Candidates to answer with, in order; the default answer once they run out.
         self.candidates: list[dict[str, Any]] = []
+        # Values returned by the embedding endpoint.
+        self.embedding: list[float] = [3.0, 4.0] + [0.0] * 766
         fake = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -38,6 +40,9 @@ class FakeGemini:
                     {"path": self.path, "body": json.loads(self.rfile.read(length))}
                 )
                 time.sleep(fake.delay_seconds)
+                if "embedcontent" in self.path.lower():  # :batchEmbedContents
+                    self._send({"embeddings": [{"values": fake.embedding}]})
+                    return
                 default = {"content": {"role": "model", "parts": [{"text": "{}"}]}}
                 answer = {
                     "candidates": [fake.candidates.pop(0) if fake.candidates else default],
@@ -47,6 +52,9 @@ class FakeGemini:
                         "thoughtsTokenCount": 15,
                     },
                 }
+                self._send(answer)
+
+            def _send(self, answer: dict[str, Any]) -> None:
                 data = json.dumps(answer).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -247,3 +255,30 @@ def test_every_agent_tool_is_declared_and_no_arg_tools_have_no_schema() -> None:
     ]
     assert config.automatic_function_calling is not None
     assert config.automatic_function_calling.disable is True
+
+
+# ---------- embeddings (similar cases) ----------
+
+
+def test_embeddings_use_the_similarity_prefix_and_768_normalised_values(
+    fake_gemini: FakeGemini,
+) -> None:
+    client = GeminiClient(api_key="test", model="gemini-3.8-flash", base_url=fake_gemini.url)
+
+    vector = client.embed("Vase cassé")
+
+    (request,) = fake_gemini.requests
+    assert "gemini-embedding-2" in request["path"]
+    sent = json.dumps(request["body"], ensure_ascii=False)
+    assert "task: sentence similarity | query: Vase cassé" in sent
+    assert '"outputDimensionality": 768' in sent
+    assert vector[:2] == pytest.approx([0.6, 0.8])  # 3-4-5 triangle: scaled to length 1
+    assert len(vector) == 768
+
+
+def test_an_embedding_of_the_wrong_size_is_an_error(fake_gemini: FakeGemini) -> None:
+    fake_gemini.embedding = [1.0, 2.0]
+    client = GeminiClient(api_key="test", model="gemini-3.8-flash", base_url=fake_gemini.url)
+
+    with pytest.raises(LLMError, match="unexpected embedding"):
+        client.embed("Vase cassé")

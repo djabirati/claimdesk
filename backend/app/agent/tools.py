@@ -1,6 +1,7 @@
 """The agent's tools. Two kinds only, and no tool can change anything outside this run:
 
-- read: look up the sender's orders and the carrier tracking;
+- read: look up the sender's orders, the carrier tracking, and how people decided on
+  similar past cases (decisions only, never another customer's text: see app/similar.py);
 - propose: record an action (refund, replacement, carrier claim, reply) for a person to
   approve. Proposals are kept in memory and saved at the end of the run; executing them
   is done by app/actions.py, which this module never imports.
@@ -31,6 +32,7 @@ from app.enums import ActionKind
 from app.llm.base import ToolCall, ToolSpec
 from app.models import Email, Order
 from app.schemas import ORDER_ID_PATTERN
+from app.similar import SimilarCasesUnavailable, find_similar_cases
 
 Effect = Literal["read", "propose"]
 
@@ -51,6 +53,8 @@ class ToolContext:
     email: Email
     now: datetime
     proposals: list[Proposal] = field(default_factory=list)
+    similar_cases_limit: int = 3
+    similar_cases_min_similarity: float = 0.6
 
     @property
     def customer(self) -> str:
@@ -172,6 +176,25 @@ def track_parcel(ctx: ToolContext, args: TrackingArgs) -> dict[str, Any]:
     return track(order, now=ctx.now)
 
 
+def similar_cases(ctx: ToolContext, args: NoArgs) -> dict[str, Any]:
+    try:
+        cases = find_similar_cases(
+            ctx.session,
+            ctx.email,
+            limit=ctx.similar_cases_limit,
+            min_similarity=ctx.similar_cases_min_similarity,
+        )
+    except SimilarCasesUnavailable as exc:
+        return {"error": f"Similar case search is unavailable: {exc}"}
+    if not cases:
+        return {"cases": [], "note": "No similar case has been decided by a person yet."}
+    return {
+        "cases": cases,
+        "note": "How people decided on similar past claims. A hint, not a rule: the facts "
+        "of this claim and the policy come first.",
+    }
+
+
 def propose_refund(ctx: ToolContext, args: RefundArgs) -> dict[str, Any]:
     order = ctx.customer_order(args.order_id)
     if order is None:
@@ -258,6 +281,14 @@ TOOLS: list[Tool] = [
         "read",
         TrackingArgs,
         track_parcel,
+    ),
+    Tool(
+        "find_similar_cases",
+        "How people decided on past claims similar to this email: category, request, and "
+        "each action executed or rejected. Decisions only, no text of other customers.",
+        "read",
+        NoArgs,
+        similar_cases,
     ),
     Tool(
         "propose_refund",

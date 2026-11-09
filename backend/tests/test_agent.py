@@ -19,7 +19,7 @@ from app.config import Settings
 from app.enums import AgentRunStatus, EmailStatus
 from app.llm.base import LLMError, Message, ModelTurn, ToolResults, UserMessage
 from app.llm.fake import FakeLLMClient, model_turn
-from app.models import AgentRun, Email
+from app.models import AgentRun, Email, EmailEmbedding
 from tests.conftest import add_seed_orders
 
 NOW = datetime(2026, 11, 1, 12, tzinfo=UTC)
@@ -294,3 +294,37 @@ def test_the_agent_cannot_execute_anything() -> None:
             for alias in node.names
         }
         assert "app.actions" not in imported, f"{path.name} imports app.actions"
+
+
+def test_the_email_is_embedded_once_for_similar_cases(session: Session, settings: Settings) -> None:
+    email = make_email(session)
+    llm = FakeLLMClient(script=[])
+
+    run_agent(session, email, llm, settings, now=NOW)
+    run_agent(session, email, llm, settings, now=NOW)  # a second run reuses the vector
+
+    assert len(llm.embedded) == 1
+    assert email.subject in llm.embedded[0] and email.body in llm.embedded[0]
+    stored = session.get_one(EmailEmbedding, email.id)
+    assert stored.model == "fake-embedding"
+    assert len(stored.embedding) == 768
+
+
+def test_an_embedding_failure_does_not_stop_the_agent(session: Session, settings: Settings) -> None:
+    email = make_email(session)
+    llm = FakeLLMClient(
+        script=[],
+        embedder=LLMError("503 embedding model overloaded"),
+        turns=[
+            model_turn(("find_similar_cases", {}), ("propose_reply", {"message": REPLY})),
+            model_turn(text="Fini, sans cas similaires."),
+        ],
+    )
+
+    agent_run = run_agent(session, email, llm, settings, now=NOW)
+
+    assert agent_run.status == AgentRunStatus.COMPLETED
+    assert "no_embedding" in agent_run.flags
+    similar, _ = tool_results(llm.calls[1]["messages"][-1])
+    assert "Similar case search is unavailable" in str(similar["error"])
+    assert [a.kind for a in agent_run.actions] == ["reply"]
