@@ -1,5 +1,5 @@
-from dataclasses import dataclass
-from typing import Protocol
+from dataclasses import dataclass, field
+from typing import Any, Protocol
 
 from pydantic import BaseModel
 
@@ -10,6 +10,60 @@ class LLMResponse:
     input_tokens: int
     output_tokens: int
     model: str
+
+
+# ---------- Tool calling (used by the agent) ----------
+# Provider-neutral types: the agent loop never sees a provider SDK object, except as the
+# opaque `raw` field that the provider client gives back to itself on the next call.
+
+
+@dataclass(frozen=True)
+class ToolSpec:
+    """A tool the model may call: its name, what it does, and a JSON schema of its arguments."""
+
+    name: str
+    description: str
+    parameters: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    name: str
+    arguments: dict[str, Any]
+    id: str | None = None  # set by providers that number their calls
+
+
+@dataclass(frozen=True)
+class ToolResult:
+    call: ToolCall
+    content: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class UserMessage:
+    text: str
+
+
+@dataclass(frozen=True)
+class ModelTurn:
+    """One answer of the model: some text, some tool calls, or both."""
+
+    text: str
+    tool_calls: list[ToolCall]
+    input_tokens: int
+    output_tokens: int
+    model: str
+    # The provider's own message, sent back unchanged in the next request. Gemini 3 needs
+    # this: its answers carry "thought signatures" that must be returned exactly.
+    raw: Any = None
+
+
+@dataclass(frozen=True)
+class ToolResults:
+    results: list[ToolResult] = field(default_factory=list)
+
+
+Message = UserMessage | ModelTurn | ToolResults
 
 
 class LLMError(Exception):
@@ -32,12 +86,22 @@ class LLMNotConfiguredError(Exception):
 class LLMClient(Protocol):
     """What the rest of the code needs from a model provider.
 
-    Keeping this interface small means the triage logic never imports a provider SDK:
-    switching from Gemini to another model only means writing a new client.
+    Keeping this interface small means the triage and agent logic never import a provider
+    SDK: switching from Gemini to another model only means writing a new client.
     """
 
     model: str
 
     def generate_json(self, *, system: str, prompt: str, schema: type[BaseModel]) -> LLMResponse:
         """Ask for a JSON answer that should follow `schema`. Validation is the caller's job."""
+        ...
+
+    def generate_with_tools(
+        self, *, system: str, messages: list[Message], tools: list[ToolSpec]
+    ) -> ModelTurn:
+        """Continue a conversation in which the model may call tools.
+
+        The client never runs a tool itself: it returns the calls, and the caller decides
+        what to do with them.
+        """
         ...

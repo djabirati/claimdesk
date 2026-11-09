@@ -1,4 +1,7 @@
-"""Background worker: takes triage jobs from the Postgres queue and runs them.
+"""Background worker: takes jobs from the Postgres queue and runs them.
+
+Two kinds of jobs: `triage` for every new email, then `agent` for an email triaged as a
+claim. The agent job is queued in the same transaction that marks the triage done.
 
 Usage (from backend/, with the database migrated and GEMINI_API_KEY set):
     python -m app.worker
@@ -16,10 +19,18 @@ import threading
 
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.agent.loop import run_agent
 from app.config import Settings, get_settings
 from app.db import SessionLocal
-from app.enums import EmailStatus, RunStatus
-from app.jobs import claim_next_job, mark_done, mark_failed, requeue_stale_jobs, schedule_retry
+from app.enums import CLAIM_CATEGORIES, AgentRunStatus, EmailStatus, JobKind, RunStatus
+from app.jobs import (
+    claim_next_job,
+    enqueue,
+    mark_done,
+    mark_failed,
+    requeue_stale_jobs,
+    schedule_retry,
+)
 from app.llm.base import LLMClient, LLMNotConfiguredError
 from app.llm.factory import build_llm_client
 from app.models import Job
@@ -30,6 +41,13 @@ log = logging.getLogger("claimdesk.worker")
 
 def process_job(session: Session, job: Job, llm: LLMClient, settings: Settings) -> None:
     """Run one claimed job and record what happened to it."""
+    if job.kind == JobKind.AGENT:
+        process_agent_job(session, job, llm, settings)
+    else:
+        process_triage_job(session, job, llm, settings)
+
+
+def process_triage_job(session: Session, job: Job, llm: LLMClient, settings: Settings) -> None:
     email = job.email
     if email.status != EmailStatus.RECEIVED:
         # Already triaged: a worker probably stopped after the triage and before marking
@@ -42,6 +60,10 @@ def process_job(session: Session, job: Job, llm: LLMClient, settings: Settings) 
 
     # run.status is read back from the database as a plain string: compare with ==, not `is`.
     if run.status == RunStatus.SUCCESS:
+        category = (email.triage or {}).get("category")
+        if category in CLAIM_CATEGORIES:
+            # Saved by the same commit as "triage done": a claim never misses its agent run.
+            enqueue(session, email=email, kind=JobKind.AGENT, max_attempts=job.max_attempts)
         mark_done(session, job)
         log.info("job %s: email %s -> %s (%d ms)", job.id, email.id, email.status, run.latency_ms)
     elif run.status == RunStatus.ERROR:
@@ -60,6 +82,37 @@ def process_job(session: Session, job: Job, llm: LLMClient, settings: Settings) 
         # with the validation error). The same email would most likely fail the same way.
         mark_failed(session, job, run.error)
         log.error("job %s: invalid model output, email %s failed: %s", job.id, email.id, run.error)
+
+
+def process_agent_job(session: Session, job: Job, llm: LLMClient, settings: Settings) -> None:
+    email = job.email
+    finished = (AgentRunStatus.COMPLETED, AgentRunStatus.STEP_LIMIT)
+    if any(run.status in finished for run in email.agent_runs):
+        # The job came back after a crash, but its run was saved: do not propose twice.
+        mark_done(session, job)
+        log.info("job %s: email %s already has an agent run, nothing to do", job.id, email.id)
+        return
+
+    run = run_agent(session, email, llm, settings)
+
+    if run.status in finished:
+        mark_done(session, job)
+        log.info(
+            "job %s: agent %s on email %s, %d step(s), %d proposal(s)",
+            job.id,
+            run.status,
+            email.id,
+            run.steps,
+            len(run.actions),
+        )
+    elif run.status == AgentRunStatus.ERROR:
+        if schedule_retry(session, job, run.error, base_seconds=settings.job_retry_base_seconds):
+            log.warning("job %s: provider error, retry at %s: %s", job.id, job.run_after, run.error)
+        else:
+            log.error("job %s: provider error, no attempt left: %s", job.id, run.error)
+    else:
+        mark_failed(session, job, run.error)
+        log.error("job %s: request rejected by the provider: %s", job.id, run.error)
 
 
 def run_once(

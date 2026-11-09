@@ -10,9 +10,9 @@ import json
 from pathlib import Path
 
 from app.config import get_settings
+from app.llm.cost import estimate_cost
 from app.llm.factory import build_llm_client
 from app.triage.classifier import classify
-from app.triage.pipeline import estimate_cost
 
 SAMPLES = Path(__file__).resolve().parents[2] / "data" / "samples" / "emails.jsonl"
 FIELDS = ["category", "requested_action", "urgency", "order_id", "tracking_number"]

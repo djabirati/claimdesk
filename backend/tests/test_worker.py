@@ -15,7 +15,7 @@ from app.config import Settings
 from app.enums import EmailStatus, JobKind, JobStatus
 from app.jobs import claim_next_job, enqueue, requeue_stale_jobs, retry_delay, utcnow
 from app.llm.base import LLMError
-from app.llm.fake import FakeLLMClient
+from app.llm.fake import FakeLLMClient, model_turn
 from app.models import Email, Job
 from app.worker import main
 from tests.conftest import triage_json
@@ -79,7 +79,7 @@ def test_provider_error_is_retried_later_then_succeeds(
     assert email.status == EmailStatus.RECEIVED  # not failed: another attempt is planned
 
     make_retries_due(session_factory)
-    assert drain() == 1
+    assert drain() == 2  # the triage succeeds, then the agent job of the claim runs
 
     email, job = load(session_factory, email_id)
     assert email.status == EmailStatus.TRIAGED
@@ -213,3 +213,88 @@ def test_future_retry_is_not_picked_early(session_factory: Factory) -> None:
 def test_worker_refuses_to_start_without_a_model(settings: Settings) -> None:
     with pytest.raises(SystemExit):
         main(settings)
+
+
+# ---------- agent jobs ----------
+
+
+def jobs_of(session_factory: Factory, email_id: int) -> list[tuple[str, str, int]]:
+    with session_factory() as session:
+        email = session.get_one(Email, email_id)
+        return [(job.kind, job.status, job.attempts) for job in email.jobs]
+
+
+def test_a_claim_gets_an_agent_job_after_its_triage(
+    session_factory: Factory, fake_llm: FakeLLMClient, drain: Drain
+) -> None:
+    fake_llm.script = [triage_json()]
+    email_id = add_email(session_factory)
+
+    assert drain() == 2
+
+    assert jobs_of(session_factory, email_id) == [("triage", "done", 1), ("agent", "done", 1)]
+
+
+def test_an_email_that_is_not_a_claim_gets_no_agent_job(
+    session_factory: Factory, fake_llm: FakeLLMClient, drain: Drain
+) -> None:
+    fake_llm.script = [
+        triage_json(category="not_a_claim", requested_action="none", order_id=None, urgency="low")
+    ]
+    email_id = add_email(session_factory)
+
+    assert drain() == 1
+
+    assert jobs_of(session_factory, email_id) == [("triage", "done", 1)]
+
+
+def test_an_agent_provider_error_is_retried_without_failing_the_email(
+    session_factory: Factory, fake_llm: FakeLLMClient, drain: Drain
+) -> None:
+    fake_llm.script = [triage_json()]
+    fake_llm.turns = [LLMError("503 overloaded"), model_turn(text="Fini.")]
+    email_id = add_email(session_factory)
+
+    drain()
+    assert jobs_of(session_factory, email_id) == [("triage", "done", 1), ("agent", "queued", 1)]
+    make_retries_due(session_factory)
+    drain()
+
+    assert jobs_of(session_factory, email_id) == [("triage", "done", 1), ("agent", "done", 2)]
+    with session_factory() as session:
+        email = session.get_one(Email, email_id)
+        assert email.status == EmailStatus.TRIAGED
+        assert [run.status for run in email.agent_runs] == ["error", "completed"]
+
+
+def test_a_rejected_agent_job_fails_but_keeps_the_triage(
+    session_factory: Factory, fake_llm: FakeLLMClient, drain: Drain
+) -> None:
+    fake_llm.script = [triage_json()]
+    fake_llm.turns = [LLMError("400 bad request", retryable=False)]
+    email_id = add_email(session_factory)
+
+    drain()
+
+    assert jobs_of(session_factory, email_id) == [("triage", "done", 1), ("agent", "failed", 1)]
+    with session_factory() as session:
+        assert session.get_one(Email, email_id).status == EmailStatus.TRIAGED
+
+
+def test_an_agent_job_that_comes_back_after_its_run_is_not_run_twice(
+    session_factory: Factory, fake_llm: FakeLLMClient, drain: Drain
+) -> None:
+    fake_llm.script = [triage_json()]
+    email_id = add_email(session_factory)
+    drain()
+    # A worker saved the agent run, then died before marking the job done.
+    with session_factory() as session:
+        session.execute(update(Job).where(Job.kind == "agent").values(status="queued"))
+        session.commit()
+    calls_before = len(fake_llm.calls)
+
+    assert drain() == 1
+
+    assert len(fake_llm.calls) == calls_before  # no new model call
+    with session_factory() as session:
+        assert len(session.get_one(Email, email_id).agent_runs) == 1

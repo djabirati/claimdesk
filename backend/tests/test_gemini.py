@@ -12,10 +12,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 import pytest
+from google.genai import types
 from pydantic import ValidationError
 
 from app.config import Settings
-from app.llm.base import LLMError
+from app.llm.base import LLMError, ToolResult, ToolResults, ToolSpec, UserMessage
 from app.llm.gemini import GeminiClient, is_retryable
 from app.schemas import TriageOutput
 
@@ -26,6 +27,8 @@ class FakeGemini:
     def __init__(self) -> None:
         self.requests: list[dict[str, Any]] = []
         self.delay_seconds = 0.0
+        # Candidates to answer with, in order; the default answer once they run out.
+        self.candidates: list[dict[str, Any]] = []
         fake = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -35,8 +38,9 @@ class FakeGemini:
                     {"path": self.path, "body": json.loads(self.rfile.read(length))}
                 )
                 time.sleep(fake.delay_seconds)
+                default = {"content": {"role": "model", "parts": [{"text": "{}"}]}}
                 answer = {
-                    "candidates": [{"content": {"role": "model", "parts": [{"text": "{}"}]}}],
+                    "candidates": [fake.candidates.pop(0) if fake.candidates else default],
                     "usageMetadata": {
                         "promptTokenCount": 120,
                         "candidatesTokenCount": 40,
@@ -142,3 +146,104 @@ def test_settings_refuse_a_triage_longer_than_the_lock_timeout() -> None:
     # 2 calls x 200 s could outlast the 300 s lock: the job would go to a second worker.
     with pytest.raises(ValidationError, match="must be below job_lock_timeout_seconds"):
         Settings(_env_file=None, llm_timeout_seconds=200)  # type: ignore[call-arg]
+
+
+# ---------- tool calling (the agent) ----------
+
+GET_ORDER = ToolSpec(
+    name="get_order",
+    description="Details of one order.",
+    parameters={
+        "type": "object",
+        "properties": {"order_id": {"type": "string"}},
+        "required": ["order_id"],
+    },
+)
+SIGNATURE = "c2lnbmF0dXJlLWZyb20tZ2VtaW5p"  # base64, as the API sends it
+
+
+def test_tool_calls_and_thought_signatures_go_back_to_gemini_unchanged(
+    fake_gemini: FakeGemini,
+) -> None:
+    # Gemini 3 rejects (400) a conversation whose function calls lost their thought
+    # signature, so the model's turn must be sent back exactly as it came.
+    fake_gemini.candidates = [
+        {
+            "content": {
+                "role": "model",
+                "parts": [
+                    {
+                        "functionCall": {
+                            "id": "call-1",
+                            "name": "get_order",
+                            "args": {"order_id": "ML-104201"},
+                        },
+                        "thoughtSignature": SIGNATURE,
+                    }
+                ],
+            }
+        },
+        {"content": {"role": "model", "parts": [{"text": "Commande vérifiée."}]}},
+    ]
+    client = GeminiClient(
+        api_key="test", model="gemini-3.8-flash", thinking_level="low", base_url=fake_gemini.url
+    )
+    messages: list[Any] = [UserMessage("Le vase est cassé.")]
+
+    turn = client.generate_with_tools(system="sys", messages=messages, tools=[GET_ORDER])
+    (call,) = turn.tool_calls
+    assert (call.id, call.name, call.arguments) == (
+        "call-1",
+        "get_order",
+        {"order_id": "ML-104201"},
+    )
+
+    messages += [turn, ToolResults([ToolResult(call=call, content={"total_eur": "89.90"})])]
+    final = client.generate_with_tools(system="sys", messages=messages, tools=[GET_ORDER])
+    assert final.text == "Commande vérifiée."
+    assert final.tool_calls == []
+
+    first, second = (request["body"] for request in fake_gemini.requests)
+    assert first["tools"][0]["functionDeclarations"][0]["name"] == "get_order"
+    user, model, tool = second["contents"]
+    assert model["role"] == "model"
+    assert model["parts"][0]["thoughtSignature"] == SIGNATURE
+    assert model["parts"][0]["functionCall"]["id"] == "call-1"
+    assert tool["parts"][0]["functionResponse"] == {
+        "id": "call-1",
+        "name": "get_order",
+        "response": {"total_eur": "89.90"},
+    }
+
+
+def test_an_empty_answer_is_a_retryable_error(fake_gemini: FakeGemini) -> None:
+    fake_gemini.candidates = [{"finishReason": "MALFORMED_FUNCTION_CALL"}]
+    client = GeminiClient(api_key="test", model="gemini-3.8-flash", base_url=fake_gemini.url)
+
+    with pytest.raises(LLMError) as raised:
+        client.generate_with_tools(system="sys", messages=[UserMessage("x")], tools=[GET_ORDER])
+
+    assert raised.value.retryable
+    assert "MALFORMED_FUNCTION_CALL" in str(raised.value)
+
+
+def test_every_agent_tool_is_declared_and_no_arg_tools_have_no_schema() -> None:
+    from app.agent.tools import TOOL_SPECS
+    from app.llm.gemini import build_tools_config
+
+    config = build_tools_config(system="sys", tools=TOOL_SPECS, thinking_level="low")
+
+    assert config.tools is not None
+    tool = config.tools[0]
+    assert isinstance(tool, types.Tool)
+    declarations = tool.function_declarations or []
+    by_name = {d.name: d for d in declarations}
+    assert set(by_name) == {spec.name for spec in TOOL_SPECS}
+    assert by_name["list_customer_orders"].parameters_json_schema is None
+    assert by_name["propose_refund"].parameters_json_schema["required"] == [  # type: ignore[index]
+        "order_id",
+        "amount_eur",
+        "reason",
+    ]
+    assert config.automatic_function_calling is not None
+    assert config.automatic_function_calling.disable is True

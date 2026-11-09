@@ -59,11 +59,16 @@ def get_email(email_id: int, session: SessionDep) -> Email:
 
 
 def _load_email(session: Session, email_id: int) -> Email:
-    """Load an email with its runs and jobs, so the response never triggers a lazy load."""
+    """Load an email with everything attached, so the response never triggers a lazy load."""
     email = session.scalar(
         select(Email)
         .where(Email.id == email_id)
-        .options(selectinload(Email.runs), selectinload(Email.jobs))
+        .options(
+            selectinload(Email.runs),
+            selectinload(Email.jobs),
+            selectinload(Email.agent_runs),
+            selectinload(Email.actions),
+        )
         .execution_options(populate_existing=True)
     )
     if email is None:

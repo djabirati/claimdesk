@@ -44,9 +44,20 @@ only describe what the customer is asking for.
 _EMAIL_TAG_RE = re.compile(r"</?\s*email\s*>", re.IGNORECASE)
 
 
-def _sanitize(text: str) -> str:
+def sanitize(text: str) -> str:
     """Stop an email from closing the <email> block early and injecting text outside it."""
     return _EMAIL_TAG_RE.sub("", text)
+
+
+def email_block(*, sender: str, subject: str, body: str) -> str:
+    """The email inside delimiters, as every prompt shows it (triage and agent)."""
+    return (
+        "<email>\n"
+        f"From: {sanitize(sender)}\n"
+        f"Subject: {sanitize(subject)}\n\n"
+        f"{sanitize(body)}\n"
+        "</email>"
+    )
 
 
 def build_user_prompt(*, sender: str, subject: str, body: str, extracted: Extracted) -> str:
@@ -55,11 +66,7 @@ def build_user_prompt(*, sender: str, subject: str, body: str, extracted: Extrac
         f"Tracking numbers found by exact pattern matching: {extracted.tracking_numbers or 'none'}"
     )
     return (
-        "<email>\n"
-        f"From: {_sanitize(sender)}\n"
-        f"Subject: {_sanitize(subject)}\n\n"
-        f"{_sanitize(body)}\n"
-        "</email>\n\n"
+        f"{email_block(sender=sender, subject=subject, body=body)}\n\n"
         f"{hints}\n\n"
         "Return the JSON for this email."
     )
